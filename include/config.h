@@ -1,28 +1,28 @@
 #pragma once
 
-// ---- Sprzet ----
+// ---- Hardware ----
 
-// GPIO sterujacy wejsciem IN modulu przekaznika.
+// GPIO driving the relay module's IN pin.
 static const int RELAY_PIN = 4;
 
-// Modul z optoizolacja: stan NISKI na IN zwiera COM-NO (pompa pracuje).
-// Jesli przekaznik klika odwrotnie niz logi - zmien na false.
+// Opto-isolated module: a LOW on IN closes COM-NO (pump runs).
+// If the relay clicks opposite to what the logs say, flip this to false.
 static const bool RELAY_ACTIVE_LOW = true;
 
-// ---- Cykl podlewania ----
+// ---- Watering cycle ----
 
-// Jak dlugo pompa pracuje w jednym cyklu.
+// How long the pump runs in one cycle.
 static const unsigned long PUMP_ON_SECONDS = 10;
 
-// Przerwa miedzy cyklami. 360 min = 6 h.
+// Gap between cycles. 360 min = 6 h.
 static const unsigned long PUMP_INTERVAL_MINUTES = 360;
 
-// Czy podlac od razu po starcie. false = po resecie czekamy pelny interwal,
-// zeby seria resetow nie zalala roslin.
+// Water immediately on boot? false means a reset waits out a full interval,
+// so a reset loop can't flood the plants.
 static const bool RUN_ON_BOOT = false;
 
-// ---- Bezpiecznik ----
+// ---- Safety ----
 
-// Twardy limit czasu pracy. Jesli PUMP_ON_SECONDS zostanie ustawione przez
-// pomylke na absurdalna wartosc, pompa i tak wylaczy sie tutaj.
+// Hard cap on run time. If PUMP_ON_SECONDS is ever set to something absurd,
+// the pump still shuts off here.
 static const unsigned long PUMP_MAX_ON_SECONDS = 60;
