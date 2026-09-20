@@ -1,19 +1,17 @@
 # waterpumpmod
 
-Interval-based controller for a 5V water pump, built on an **ESP32 DevKit board with
-an ESP-WROOM-32 module** and a single-channel opto-isolated relay module
+Networked controller for a 5V water pump / cat fountain, built on an **ESP32 DevKit
+board with an ESP-WROOM-32 module** and a single-channel opto-isolated relay module
 (10A/250VAC contacts, 5V coil).
 
-Written against **ESP-IDF** with deep sleep between cycles, so it can run from a
-battery: roughly 10 µA at the module versus ~50 mA for an always-awake loop.
+Written against **ESP-IDF**. The board stays awake on WiFi and exposes a small REST
+API, so it waters on a schedule *and* pours on demand — a cat that walks up between
+cycles can be served from the phone instead of waiting for the next interval.
 
-Caveat for this board: a DevKit's USB-UART bridge and LDO keep drawing current even
-while the chip sleeps, so measured at the 5V pin you'll see a few mA, not µA. For a
-genuinely long battery run you'd power the WROOM module directly rather than through
-the DevKit's 5V pin.
-
-No WiFi, no UI — the board wakes on a timer, runs the pump for N seconds, and goes
-back to sleep.
+> **This build is mains powered, not battery powered.** An always-on radio and CPU
+> draw roughly 50–80 mA. Earlier revisions deep-slept between cycles for a ~10 µA
+> average; that is gone, because a sleeping board cannot answer the app. The pump
+> needs a 5V supply anyway.
 
 ## Wiring
 
@@ -60,46 +58,113 @@ separately while keeping the ground shared.
 
 ## How it works
 
-A deep-sleep wake is a **fresh boot**, not a resumed program — execution starts from
-`app_main()` every time, and ordinary globals are re-initialised. So there is no main
-loop here; one pass through `app_main()` is one watering cycle:
+`app_main()` starts four things and returns; FreeRTOS keeps them running:
 
 ```
-wake (timer) → release pin hold → pump ON → wait → pump OFF → sleep again
+                  schedule timer ─┐
+  HTTP POST /api/pump/on ─────────┼──► request queue ──► pump task ──► relay
+       (future) LD2410C radar ────┘
 ```
 
-Two details this forces, both in [src/main.c](src/main.c):
+Everything that can ask for water puts a request on one queue, and a single **pump
+task** ([src/pump.c](src/pump.c)) is the only code that touches the GPIO. That is
+what keeps a manual pour and a scheduled cycle from fighting over the relay — they
+queue instead of racing.
 
-- **`cycle_count` lives in RTC memory** (`RTC_DATA_ATTR`). That region keeps its
-  contents while the CPU is off; a normal global would reset to zero on every wake.
-- **The relay pin is latched with `rtc_gpio_hold_en()` before sleeping.** Without it
-  the pin floats once the digital core powers down, and a floating IN can energise the
-  relay mid-sleep — the pump would run unattended until the tank or battery ran out.
-  The hold survives the wake, so `app_main()` releases it with `rtc_gpio_hold_dis()`
-  before driving the pin again.
+Details worth knowing:
 
-  On the classic ESP32 this latch lives in the RTC domain. That has two consequences:
-  **the relay pin must be an RTC-capable GPIO** (GPIO27 is; GPIO16–19, 21–23 and 25
-  are not), and the RTC peripheral domain has to be kept powered with
-  `esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON)` — otherwise the
-  hold is dropped the instant the chip powers down.
+- **Watering does not depend on the network.** The pump task and its timer are
+  started before WiFi and never wait on it. If the router disappears the fountain
+  keeps running its schedule; only the API goes quiet. The WiFi layer retries with
+  a backoff up to 60 s, forever.
+- **A run can be cut short.** The pump task waits in one-second slices on a task
+  notification rather than a flat delay, so `POST /api/pump/off` stops the pump
+  within about a second instead of at the end of the run.
+- **A stop only cancels the run it was aimed at.** Each run carries an id, so a stop
+  that arrives just as one run ends cannot cancel the next one.
+- **The safety cap is enforced at runtime**, on every request, whatever its source —
+  see `PUMP_MAX_ON_SECONDS` below.
+
+## REST API
+
+The board announces itself over mDNS as **`waterpump.local`**. If mDNS does not
+resolve on your network (it is unreliable on some Windows setups and on guest VLANs),
+use the IP address from the boot log instead. There is **no authentication** — anyone
+on the LAN can run the pump.
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| `GET` | `/api/status` | — | State, counters and current config |
+| `POST` | `/api/pump/on` | `{"seconds": 15}` | `seconds` optional → `manual_run_seconds` |
+| `POST` | `/api/pump/off` | — | Cuts a running cycle short; no-op when idle |
+| `GET` | `/api/config` | — | Current settings |
+| `POST` | `/api/config` | any subset of fields | Persists to NVS, re-arms the schedule |
+
+`GET /api/status` returns:
+
+```json
+{
+  "pumping": false, "seconds_left": 0, "seconds_total": 0,
+  "cycle_count": 12, "uptime_s": 43201, "wifi_rssi": -58,
+  "mode": "interval", "interval_seconds": 3600,
+  "run_seconds": 1200, "manual_run_seconds": 30
+}
+```
+
+`POST /api/config` accepts `interval_seconds`, `run_seconds`, `manual_run_seconds`
+and `mode` (`interval`, `on_demand`, `presence`). Omitted fields keep their value.
+**Out-of-range values are rejected with HTTP 400, never silently clamped** — a typo
+in the app surfaces as an error rather than as a surprise at the bowl. The rules:
+run times must be 1…`PUMP_MAX_ON_SECONDS`, the interval at least 60 s, and a cycle
+must be shorter than its own interval.
+
+```sh
+curl http://waterpump.local/api/status
+curl -X POST http://waterpump.local/api/pump/on -d '{"seconds":10}'
+curl -X POST http://waterpump.local/api/pump/off
+curl -X POST http://waterpump.local/api/config -d '{"interval_seconds":7200}'
+```
 
 ## Configuration
 
-Everything lives in [include/config.h](include/config.h):
+Live settings are stored in **NVS** and changed over the API. Reflashing does not
+reset them; `pio run -t erase` does.
+
+[include/config.h](include/config.h) holds the wiring constants and the factory
+defaults used the first time the board boots with an empty NVS partition:
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `RELAY_GPIO` | `27` | GPIO driving the relay's IN pin (must be RTC-capable) |
+| `RELAY_GPIO` | `27` | GPIO driving the relay's IN pin |
 | `RELAY_ACTIVE_LOW` | `1` | A LOW level energises the relay |
-| `PUMP_ON_SECONDS` | `10` | Pump run time per cycle |
-| `PUMP_INTERVAL_SECONDS` | `21600` | Sleep between cycles (21600 s = 6 h) |
-| `RUN_ON_FIRST_BOOT` | `0` | Water on cold boot, or wait one interval |
-| `PUMP_MAX_ON_SECONDS` | `60` | Hard cap — clamps `PUMP_ON_SECONDS` |
+| `PUMP_ON_SECONDS` | `1200` | Run time of one scheduled cycle (20 min) |
+| `PUMP_INTERVAL_SECONDS` | `3600` | Gap between cycles (1 h) |
+| `PUMP_MANUAL_ON_SECONDS` | `30` | Default duration of a "pour now" request |
+| `RUN_ON_FIRST_BOOT` | `1` | Water on cold boot, or wait one interval |
+| `PUMP_MAX_ON_SECONDS` | `1800` | Hard cap, enforced on every request (30 min) |
 
-Board-level settings (4MB flash size, UART console) are in
-[sdkconfig.defaults](sdkconfig.defaults). ESP-IDF is configured through Kconfig, so
-those belong there rather than in `build_flags`.
+WiFi credentials go in `include/wifi_secrets.h`, which is gitignored. Copy the
+template and fill it in:
+
+```sh
+cp include/wifi_secrets.h.example include/wifi_secrets.h
+```
+
+Board-level settings (flash size, UART console, CPU frequency) are in
+[sdkconfig.defaults](sdkconfig.defaults), and the flash layout in
+[partitions.csv](partitions.csv) — the default single-app table caps the application
+at 1 MB, which this build nearly fills once WiFi, HTTP and mDNS are linked in.
+
+## Operating modes
+
+`mode` in the config selects where scheduled watering comes from:
+
+- **`interval`** — pour every `interval_seconds`. The normal setting.
+- **`on_demand`** — never pour by itself; only the app triggers the pump.
+- **`presence`** — reserved for an **HLK-LD2410C** 24 GHz presence radar, which is
+  not wired up yet. The firmware accepts and reports the mode, but currently behaves
+  like `on_demand`. When the module arrives, its UART driver posts to the same
+  request queue and nothing else has to change.
 
 ## Building
 
@@ -107,39 +172,43 @@ those belong there rather than in `build_flags`.
 pio run                  # compile
 pio run -t upload        # flash
 pio device monitor       # logs, 115200
+pio run -t erase         # wipe flash, including stored settings
 pio run -t menuconfig    # ESP-IDF configuration UI
 ```
+
+The mDNS component is pulled from the ESP Component Registry on the first build
+(see [src/idf_component.yml](src/idf_component.yml)), so that build needs network
+access.
 
 Most DevKit boards auto-reset into the bootloader via DTR/RTS. If yours doesn't: hold
 **BOOT (IO0)**, tap **EN/RST**, release BOOT.
 
-> The console runs over UART0, through the board's USB-UART bridge (CP2102 or CH340).
-> The bridge stays powered from USB, so unlike a native-USB board the monitor keeps
-> its connection during deep sleep — the port just goes quiet until the next wake.
-> You may need the driver for your bridge chip if the port doesn't appear.
-
 ## Dry run — do this before connecting the pump
 
 1. Connect **only** the ESP32 and the relay (VCC / GND / IN). Leave COM and NO empty.
-2. Temporarily set in `config.h`:
-   `PUMP_ON_SECONDS 3`, `PUMP_INTERVAL_SECONDS 10`, `RUN_ON_FIRST_BOOT 1`.
-3. `pio run -t upload && pio device monitor`
-4. Expected: an audible **click**, the module's LED on for 3 s, a click back, then a
-   sleep message — and a fresh boot banner ten seconds later.
+2. Fill in `include/wifi_secrets.h`, then flash and open the monitor.
+3. Expected in the log: the banner, `WiFi started`, an IP address, `mDNS up`, and
+   `REST API listening on port 80`. With `RUN_ON_FIRST_BOOT 1` you also get an
+   audible **click**, the module's LED, and a click back.
    - No clicks → 3.3V isn't enough, add the transistor driver above.
    - Clicks inverted relative to the log → flip `RELAY_ACTIVE_LOW`.
-5. Put a multimeter in continuity mode across **COM–NO**: open when off, closed when
+4. Shorten the schedule for testing:
+   `curl -X POST http://waterpump.local/api/config -d '{"interval_seconds":60,"run_seconds":3}'`
+   You should hear a cycle every minute.
+5. Check the manual path: `curl -X POST http://waterpump.local/api/pump/on -d '{"seconds":5}'`
+   clicks immediately, and `/api/pump/off` during a run stops it within a second.
+6. Check the guard rail: `curl -X POST http://waterpump.local/api/config -d '{"run_seconds":9999}'`
+   must return **400**. If it returns 200, stop and fix that before adding water.
+7. Put a multimeter in continuity mode across **COM–NO**: open when off, closed when
    on. This confirms you're using the right contact pair.
-6. **Leave it sleeping and watch the relay for a minute.** It must stay silent. A
-   click during sleep means the pin isn't being held — check `rtc_gpio_hold_en()`.
-7. Only now wire in the pump and watch one full cycle.
-8. Restore your real `PUMP_ON_SECONDS` / `PUMP_INTERVAL_SECONDS`, set
-   `RUN_ON_FIRST_BOOT 0`, and flash again.
+8. Pull the router or disconnect the AP for a few minutes. The schedule must keep
+   running, and the API must answer again once the network is back.
+9. Only now wire in the pump and watch one full cycle.
+10. Restore your real settings through `/api/config`.
 
 ## Note on timing
 
-The wake timer runs off the RTC oscillator, which drifts by a few percent with
-temperature — over a 6-hour sleep that's minutes, which does not matter for watering
-plants. Sleep time also does not accumulate across power loss: unplug the board and
-the schedule restarts from the cold boot. If you ever need a real time of day, that
-means WiFi + NTP or an external RTC.
+The interval is a plain periodic timer measured from boot, not a time of day, and it
+restarts from zero after a power cut. Drift is a few seconds per hour — irrelevant
+for watering. If you ever need "every day at 08:00", that means SNTP (the board is on
+WiFi now, so this is no longer far off) or an external RTC.

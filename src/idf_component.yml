@@ -1,0 +1,3 @@
+## Managed components pulled from the ESP Component Registry at build time.
+dependencies:
+  espressif/mdns: "^1.2.0"
