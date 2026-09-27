@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -23,6 +24,20 @@ typedef struct {
 	uint32_t cycle_count;
 } pump_state_t;
 
+// How many finished runs pump_get_history() remembers. Kept in RAM only, so a
+// reboot starts the history afresh.
+#define PUMP_HISTORY_LEN 10
+
+typedef struct {
+	// esp_timer clock (microseconds since boot) at which the relay switched on.
+	int64_t started_us;
+	uint32_t seconds_requested;
+	// How long the pump actually ran; shorter than requested if stopped early.
+	uint32_t seconds_run;
+	pump_source_t source;
+	bool stopped_early;
+} pump_history_entry_t;
+
 // Starts the relay GPIO, the pump task and the schedule timer. Must be called
 // after pump_config_load().
 esp_err_t pump_init(const pump_config_t *cfg);
@@ -37,6 +52,16 @@ void pump_stop(void);
 
 // Snapshot of what the pump is doing right now.
 void pump_get_state(pump_state_t *out_state);
+
+// Copies up to `max` finished runs into `out`, newest first. Returns how many.
+size_t pump_get_history(pump_history_entry_t *out, size_t max);
+
+// esp_timer time (microseconds since boot) of the next scheduled cycle, or -1
+// if the schedule is not active under the current configuration.
+int64_t pump_next_scheduled_us(void);
+
+// Wire name of a source, for the JSON API.
+const char *pump_source_name(pump_source_t source);
 
 // Swaps in a new configuration and re-arms the schedule timer. The caller is
 // expected to have validated `cfg`.

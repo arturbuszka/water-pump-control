@@ -1,3 +1,7 @@
 ## Managed components pulled from the ESP Component Registry at build time.
 dependencies:
   espressif/mdns: "^1.2.0"
+  # This framework package for ESP-IDF 6.1.0 doesn't bundle the old built-in
+  # "json" (cJSON) component, so http_api.c's dependency on it has to come
+  # from the registry instead.
+  espressif/cjson: "^1.7.18"

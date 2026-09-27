@@ -37,6 +37,23 @@ static uint32_t s_run_id;
 static uint32_t s_stop_run_id;
 static uint32_t s_next_run_id = 1;
 
+// Ring buffer of finished runs, and when the periodic timer fires next. Both
+// are touched only under s_state_lock.
+static pump_history_entry_t s_history[PUMP_HISTORY_LEN];
+static size_t s_history_next;
+static size_t s_history_count;
+static int64_t s_next_due_us;
+
+static void history_push(const pump_history_entry_t *entry) {
+	xSemaphoreTake(s_state_lock, portMAX_DELAY);
+	s_history[s_history_next] = *entry;
+	s_history_next = (s_history_next + 1) % PUMP_HISTORY_LEN;
+	if (s_history_count < PUMP_HISTORY_LEN) {
+		s_history_count++;
+	}
+	xSemaphoreGive(s_state_lock);
+}
+
 // True when the run that is currently executing has been told to stop.
 static bool stop_pending(void) {
 	xSemaphoreTake(s_state_lock, portMAX_DELAY);
@@ -99,8 +116,10 @@ static void pump_run(pump_source_t source, uint32_t seconds) {
 	// Drive the loop off the clock rather than off a tick count: a notification
 	// that is not a stop (a stale one, say) would otherwise skip its second and
 	// cut the run short.
+	const int64_t started_us = esp_timer_get_time();
 	const TickType_t started = xTaskGetTickCount();
 	const TickType_t duration = pdMS_TO_TICKS(seconds * 1000);
+	bool stopped_early = false;
 	for (;;) {
 		TickType_t elapsed = xTaskGetTickCount() - started;
 		if (elapsed >= duration) {
@@ -113,6 +132,7 @@ static void pump_run(pump_source_t source, uint32_t seconds) {
 		if (ulTaskNotifyTake(pdTRUE, slice) > 0 && stop_pending()) {
 			ESP_LOGI(TAG, "run cut short after %lu s",
 			         (unsigned long)((xTaskGetTickCount() - started) / configTICK_RATE_HZ));
+			stopped_early = true;
 			break;
 		}
 		elapsed = xTaskGetTickCount() - started;
@@ -122,6 +142,15 @@ static void pump_run(pump_source_t source, uint32_t seconds) {
 	ESP_ERROR_CHECK(gpio_set_level(RELAY_GPIO, RELAY_LEVEL_OFF));
 	state_set_idle();
 	ESP_LOGI(TAG, "pump OFF");
+
+	int64_t ran_us = esp_timer_get_time() - started_us;
+	history_push(&(pump_history_entry_t){
+		.started_us = started_us,
+		.seconds_requested = seconds,
+		.seconds_run = (uint32_t)((ran_us + 500000) / 1000000),
+		.source = source,
+		.stopped_early = stopped_early,
+	});
 }
 
 static void pump_task(void *arg) {
@@ -141,10 +170,16 @@ static void pump_task(void *arg) {
 static void schedule_timer_cb(void *arg) {
 	(void)arg;
 	pump_config_t cfg;
-	pump_get_config(&cfg);
-	if (cfg.mode != PUMP_MODE_INTERVAL) {
-		// On-demand and presence modes keep the timer armed but ignore it, so
-		// switching back to interval does not need the timer rebuilt.
+	xSemaphoreTake(s_state_lock, portMAX_DELAY);
+	cfg = s_cfg;
+	// The periodic timer fires again one interval from now, whether or not
+	// this particular tick waters.
+	s_next_due_us = esp_timer_get_time() + (int64_t)cfg.interval_seconds * 1000000;
+	xSemaphoreGive(s_state_lock);
+	if (!pump_schedule_active(&cfg)) {
+		// On-demand and presence modes without the optional schedule keep the
+		// timer armed but ignore it, so turning it on does not need the timer
+		// rebuilt.
 		return;
 	}
 	esp_err_t err = pump_request(PUMP_SOURCE_SCHEDULE, 0);
@@ -160,6 +195,9 @@ static void rearm_timer(uint32_t interval_seconds) {
 	esp_timer_stop(s_schedule_timer);  // fails harmlessly if not running
 	ESP_ERROR_CHECK(esp_timer_start_periodic(s_schedule_timer,
 	                                         (uint64_t)interval_seconds * 1000000ULL));
+	xSemaphoreTake(s_state_lock, portMAX_DELAY);
+	s_next_due_us = esp_timer_get_time() + (int64_t)interval_seconds * 1000000;
+	xSemaphoreGive(s_state_lock);
 }
 
 esp_err_t pump_init(const pump_config_t *cfg) {
@@ -185,7 +223,7 @@ esp_err_t pump_init(const pump_config_t *cfg) {
 	ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_schedule_timer));
 	rearm_timer(s_cfg.interval_seconds);
 
-	if (RUN_ON_FIRST_BOOT && s_cfg.mode == PUMP_MODE_INTERVAL) {
+	if (RUN_ON_FIRST_BOOT && pump_schedule_active(&s_cfg)) {
 		ESP_LOGI(TAG, "first-boot watering");
 		pump_request(PUMP_SOURCE_SCHEDULE, 0);
 	}
@@ -252,4 +290,32 @@ void pump_get_config(pump_config_t *out_cfg) {
 	xSemaphoreTake(s_state_lock, portMAX_DELAY);
 	*out_cfg = s_cfg;
 	xSemaphoreGive(s_state_lock);
+}
+
+size_t pump_get_history(pump_history_entry_t *out, size_t max) {
+	xSemaphoreTake(s_state_lock, portMAX_DELAY);
+	size_t n = s_history_count < max ? s_history_count : max;
+	for (size_t i = 0; i < n; i++) {
+		// s_history_next is one past the newest entry.
+		size_t idx = (s_history_next + PUMP_HISTORY_LEN - 1 - i) % PUMP_HISTORY_LEN;
+		out[i] = s_history[idx];
+	}
+	xSemaphoreGive(s_state_lock);
+	return n;
+}
+
+int64_t pump_next_scheduled_us(void) {
+	xSemaphoreTake(s_state_lock, portMAX_DELAY);
+	int64_t due = pump_schedule_active(&s_cfg) ? s_next_due_us : -1;
+	xSemaphoreGive(s_state_lock);
+	return due;
+}
+
+const char *pump_source_name(pump_source_t source) {
+	switch (source) {
+		case PUMP_SOURCE_SCHEDULE: return "schedule";
+		case PUMP_SOURCE_MANUAL: return "manual";
+		case PUMP_SOURCE_PRESENCE: return "presence";
+		default: return "unknown";
+	}
 }

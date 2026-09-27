@@ -9,7 +9,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "ld2410_uart.h"
 #include "net.h"
+#include "presence.h"
 #include "pump.h"
 #include "pump_config.h"
 
@@ -89,11 +91,34 @@ static bool get_uint_field(const cJSON *root, const char *name, uint32_t *out, b
 	return true;
 }
 
+// Pulls a boolean field. Like get_uint_field, a present field of the wrong type
+// is an error rather than a missing value.
+static bool get_bool_field(const cJSON *root, const char *name, bool *out, bool *found,
+                           const char **bad_field) {
+	const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+	if (item == NULL || cJSON_IsNull(item)) {
+		*found = false;
+		return true;
+	}
+	if (!cJSON_IsBool(item)) {
+		*bad_field = name;
+		return false;
+	}
+	*out = cJSON_IsTrue(item);
+	*found = true;
+	return true;
+}
+
 static void add_config_fields(cJSON *root, const pump_config_t *cfg) {
 	cJSON_AddStringToObject(root, "mode", pump_mode_name(cfg->mode));
+	cJSON_AddBoolToObject(root, "schedule_enabled", cfg->schedule_enabled);
 	cJSON_AddNumberToObject(root, "interval_seconds", cfg->interval_seconds);
 	cJSON_AddNumberToObject(root, "run_seconds", cfg->run_seconds);
 	cJSON_AddNumberToObject(root, "manual_run_seconds", cfg->manual_run_seconds);
+	cJSON_AddNumberToObject(root, "presence_cooldown_seconds", cfg->presence_cooldown_seconds);
+	cJSON_AddNumberToObject(root, "presence_max_gate", cfg->presence_max_gate);
+	cJSON_AddNumberToObject(root, "presence_sensitivity", cfg->presence_sensitivity);
+	cJSON_AddNumberToObject(root, "presence_no_one_seconds", cfg->presence_no_one_seconds);
 }
 
 static esp_err_t status_get_handler(httpd_req_t *req) {
@@ -109,7 +134,40 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
 	cJSON_AddNumberToObject(root, "cycle_count", state.cycle_count);
 	cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000));
 	cJSON_AddNumberToObject(root, "wifi_rssi", net_rssi());
+	cJSON_AddBoolToObject(root, "presence_detected", presence_is_detected());
+	if (state.pumping) {
+		cJSON_AddStringToObject(root, "source", pump_source_name(state.source));
+	}
+	// The board has no wall clock, so times go out relative to now and the app
+	// turns them into clock times with its own.
+	int64_t next_us = pump_next_scheduled_us();
+	if (next_us < 0) {
+		cJSON_AddNullToObject(root, "next_run_in_s");
+	} else {
+		int64_t in_us = next_us - esp_timer_get_time();
+		cJSON_AddNumberToObject(root, "next_run_in_s", in_us > 0 ? (double)(in_us / 1000000) : 0);
+	}
 	add_config_fields(root, &cfg);
+	return send_json(req, 200, root);
+}
+
+static esp_err_t history_get_handler(httpd_req_t *req) {
+	pump_history_entry_t entries[PUMP_HISTORY_LEN];
+	size_t n = pump_get_history(entries, PUMP_HISTORY_LEN);
+	int64_t now_us = esp_timer_get_time();
+
+	cJSON *root = cJSON_CreateObject();
+	cJSON *runs = cJSON_AddArrayToObject(root, "runs");
+	for (size_t i = 0; i < n; i++) {
+		cJSON *run = cJSON_CreateObject();
+		cJSON_AddStringToObject(run, "source", pump_source_name(entries[i].source));
+		cJSON_AddNumberToObject(run, "started_ago_s",
+		                        (double)((now_us - entries[i].started_us) / 1000000));
+		cJSON_AddNumberToObject(run, "seconds", entries[i].seconds_run);
+		cJSON_AddNumberToObject(run, "seconds_requested", entries[i].seconds_requested);
+		cJSON_AddBoolToObject(run, "stopped_early", entries[i].stopped_early);
+		cJSON_AddItemToArray(runs, run);
+	}
 	return send_json(req, 200, root);
 }
 
@@ -180,11 +238,23 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
 	const char *bad_field = NULL;
 	if (!get_uint_field(body, "interval_seconds", &cfg.interval_seconds, &found, &bad_field) ||
 	    !get_uint_field(body, "run_seconds", &cfg.run_seconds, &found, &bad_field) ||
-	    !get_uint_field(body, "manual_run_seconds", &cfg.manual_run_seconds, &found, &bad_field)) {
+	    !get_uint_field(body, "manual_run_seconds", &cfg.manual_run_seconds, &found, &bad_field) ||
+	    !get_uint_field(body, "presence_cooldown_seconds", &cfg.presence_cooldown_seconds, &found,
+	                    &bad_field) ||
+	    !get_uint_field(body, "presence_max_gate", &cfg.presence_max_gate, &found, &bad_field) ||
+	    !get_uint_field(body, "presence_sensitivity", &cfg.presence_sensitivity, &found,
+	                    &bad_field) ||
+	    !get_uint_field(body, "presence_no_one_seconds", &cfg.presence_no_one_seconds, &found,
+	                    &bad_field)) {
 		cJSON_Delete(body);
 		char msg[80];
 		snprintf(msg, sizeof(msg), "%s must be a non-negative number", bad_field);
 		return send_error(req, 400, msg);
+	}
+
+	if (!get_bool_field(body, "schedule_enabled", &cfg.schedule_enabled, &found, &bad_field)) {
+		cJSON_Delete(body);
+		return send_error(req, 400, "schedule_enabled must be true or false");
 	}
 
 	const cJSON *mode_item = cJSON_GetObjectItemCaseSensitive(body, "mode");
@@ -206,6 +276,9 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
 		return send_error(req, 503, "could not persist config");
 	}
 	pump_apply_config(&cfg);
+	// Best-effort: the sensor being unreachable shouldn't fail a config save
+	// that otherwise took - presence_init()'s debounce still runs off cfg.
+	ld2410_uart_apply_config(&cfg);
 
 	cJSON *root = cJSON_CreateObject();
 	cJSON_AddBoolToObject(root, "ok", true);
@@ -216,7 +289,7 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
 esp_err_t http_api_start(void) {
 	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 	config.lru_purge_enable = true;
-	// Two GETs and three POSTs, registered below.
+	// Three GETs and three POSTs, registered below.
 	config.max_uri_handlers = 8;
 
 	httpd_handle_t server = NULL;
@@ -228,6 +301,7 @@ esp_err_t http_api_start(void) {
 
 	static const httpd_uri_t routes[] = {
 		{.uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler},
+		{.uri = "/api/history", .method = HTTP_GET, .handler = history_get_handler},
 		{.uri = "/api/pump/on", .method = HTTP_POST, .handler = pump_on_handler},
 		{.uri = "/api/pump/off", .method = HTTP_POST, .handler = pump_off_handler},
 		{.uri = "/api/config", .method = HTTP_GET, .handler = config_get_handler},
