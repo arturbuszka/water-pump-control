@@ -5,8 +5,10 @@ board with an ESP-WROOM-32 module** and a single-channel opto-isolated relay mod
 (10A/250VAC contacts, 5V coil).
 
 Written against **ESP-IDF**. The board stays awake on WiFi and exposes a small REST
-API, so it waters on a schedule *and* pours on demand — a cat that walks up between
-cycles can be served from the phone instead of waiting for the next interval.
+API, so it can pour on a schedule, on demand from the phone, or by itself when a
+presence sensor (a PIR or an HLK-LD2410C radar) sees a cat at the bowl — for as long
+as the cat stays, not for a fixed time. The phone app is a separate PWA, Posejdon,
+which proxies this API.
 
 > **This build is mains powered, not battery powered.** An always-on radio and CPU
 > draw roughly 50–80 mA. Earlier revisions deep-slept between cycles for a ~10 µA
@@ -32,6 +34,32 @@ ESP32 GPIO27 ─────────────────────RELA
 
 ### Adding the presence sensor (`presence` mode only)
 
+Two sensors are supported; set `presence_sensor` over the API (`pir` or `ld2410`,
+default `PRESENCE_SENSOR_DEFAULT`) to say which one is wired. It is read once at
+boot, so a change takes effect after a restart (power-cycle the board or tap
+**EN/RST**) — `GET /api/status` reports `restart_required: true` until then. Each has a small driver behind
+[include/presence_sensor.h](include/presence_sensor.h)
+([src/sensor_pir.c](src/sensor_pir.c), [src/sensor_ld2410.c](src/sensor_ld2410.c)).
+Both put their HIGH/LOW "someone is there" signal on the same `OUT` pin.
+
+**PIR motion sensor** (`pir`, e.g. HC-SR301 mini):
+
+```
+3.3V or 5V (check the module) ── PIR  VCC
+GND ──────────────────────────── PIR  GND (shared with ESP32 and relay)
+ESP32 GPIO33 ─────────────────── PIR  OUT
+```
+
+- The driver enables GPIO33's internal pull-down, so an unplugged or weakly
+  driven sensor reads "nobody there".
+- PIR modules settle for 30–60 s after power-up and can pulse meanwhile, so for
+  `PIR_WARMUP_SECONDS` after boot `OUT` is logged and reported
+  (`presence_warming_up: true`) but never triggers a pour.
+- There is nothing to configure on the sensor, so the `presence_max_gate` /
+  `_sensitivity` / `_no_one_seconds` fields are hidden from the API.
+
+**HLK-LD2410C radar** (`ld2410`):
+
 ```
 5V  ──────────────────────────── LD2410C  VCC
 GND ──────────────────────────── LD2410C  GND (shared with ESP32 and relay)
@@ -40,15 +68,15 @@ ESP32 GPIO17 (TX) ──────────────LD2410C  RX
 ESP32 GPIO16 (RX) ──────────────LD2410C  TX
 ```
 
-- **`OUT`** is a simple HIGH/LOW "someone is there" signal — this is all the
-  presence task ([src/presence.c](src/presence.c)) reads at runtime. Stock LD2410C
-  firmware drives it active-HIGH; flip `PRESENCE_ACTIVE_HIGH` in `config.h` if a
-  dry run shows the opposite.
+- **`OUT`** is what presence mode runs on, as with the PIR. Stock LD2410C firmware
+  drives it active-HIGH; flip `PRESENCE_ACTIVE_HIGH` in `config.h` if a dry run shows
+  the opposite.
 - **`TX`/`RX`** are the sensor's own UART, wired to the ESP32's second UART port
   (distinct from UART0's console). The board only *writes* configuration through
-  this link — sensitivity, distance gates, no-one timeout — whenever `presence_*`
-  settings change over the API; it doesn't read the sensor's richer distance/motion
-  data back. See [src/ld2410_uart.c](src/ld2410_uart.c).
+  this link — sensitivity, distance gates, no-one timeout — at boot and whenever
+  those settings change over the API; it doesn't read the sensor's richer
+  distance/motion data back. See [src/ld2410_uart.c](src/ld2410_uart.c).
+  `presence_sensor_responding` in the status says whether the last push was acked.
 
 ### Rules worth following
 
@@ -85,7 +113,7 @@ separately while keeping the ground shared.
   HTTP POST /api/pump/on ─────────┼──► request queue ──► pump task ──► relay
      presence task (GPIO33) ──────┘
 
-  presence task ──(sensor config changes)──► ld2410_uart ──► LD2410C TX/RX
+  boot, HTTP POST /api/config ──► sensor driver ──► LD2410C TX/RX (radar tuning only)
 ```
 
 Everything that can ask for water puts a request on one queue, and a single **pump
@@ -93,13 +121,11 @@ task** ([src/pump.c](src/pump.c)) is the only code that touches the GPIO. That i
 what keeps a manual pour and a scheduled cycle from fighting over the relay — they
 queue instead of racing.
 
-The **presence task** ([src/presence.c](src/presence.c)) polls `PRESENCE_GPIO` every
-`PRESENCE_POLL_MS`, independent of `mode` — the reading always shows up in
-`GET /api/status` as `presence_detected` — but only queues a pump request when `mode`
-is `presence`. A detection needs `PRESENCE_DEBOUNCE_SAMPLES` consecutive agreeing
-reads before it counts, to filter noise at the edge of the sensor's range; after a
-confirmed detection the task ignores the sensor for `presence_cooldown_seconds`
-before re-arming, so one long visit doesn't retrigger the pump over and over.
+The **presence task** ([src/presence.c](src/presence.c)) samples `PRESENCE_GPIO`
+every `PRESENCE_POLL_MS` in every mode — the reading always shows up in
+`GET /api/status` as `presence_detected` and in the pulse log — but only acts on it
+when `mode` is `presence`. How it decides is described in
+[Presence mode](#presence-mode) below.
 
 Details worth knowing:
 
@@ -115,6 +141,68 @@ Details worth knowing:
 - **The safety cap is enforced at runtime**, on every request, whatever its source —
   see `PUMP_MAX_ON_SECONDS` below.
 
+## Operating modes
+
+`mode` in the config selects what makes the pump run:
+
+- **`interval`** — pour `run_seconds` every `interval_seconds`. The schedule is
+  always on in this mode.
+- **`on_demand`** — pour when the app asks for it. Adds the schedule on top only if
+  `schedule_enabled` is `true`.
+- **`presence`** — pour when the presence sensor sees someone at the bowl, for as
+  long as it keeps seeing them — see [Presence mode](#presence-mode). Adds the
+  schedule on top only if `schedule_enabled` is `true`; a presence session never
+  starts while a scheduled cycle is running.
+
+`POST /api/pump/on` works in every mode. `schedule_enabled` is stored but ignored in
+`interval` mode, so switching back to another mode restores whatever was set there.
+`interval_seconds` is measured from the start of one cycle to the start of the next:
+20 minutes of pumping followed by 60 minutes of rest is `run_seconds: 1200`,
+`interval_seconds: 4800`.
+
+## Presence mode
+
+A sensor pulse says "something moved", not "a cat is drinking", so the board
+does not react to single pulses. It keeps a **presence score** `x`: each pulse adds
+1 (up to `PRESENCE_X_MAX`), and between pulses the score decays with time constant
+`presence_hold_seconds`:
+
+```
+x[k] = min( x[k−1] · e^(−Δt / hold) + e[k],  x_max )
+```
+
+- **What counts as a pulse.** `e[k]` is 1 once `OUT` has been HIGH for
+  `PRESENCE_MIN_PULSE_MS` (shorter spikes are noise), and again every
+  `PRESENCE_REEMIT_MS` it stays HIGH — so a sensor that holds `OUT` HIGH through
+  continuous motion keeps counting instead of looking like one pulse.
+- **Start and stop.** The pump follows `x` with hysteresis: a session starts when `x`
+  reaches the start threshold and ends when it falls below `PRESENCE_TH_OFF`. After
+  the last pulse the pump keeps pouring for `hold · ln(x_peak / 0.3)` — some 20–30 s
+  after a single PIR pulse (a cat walking past), up to ~40 s after a drinking
+  session. The pour follows the visit instead of being fixed.
+- **Ignoring a cat walking past.** With `presence_confirm_pulses: 2` the start
+  threshold becomes `1 + e^(−window / hold)`, so a session starts only on a second
+  pulse within `presence_confirm_window_seconds` — at the cost of a few seconds'
+  delay.
+
+Hard limits sit around the score:
+
+| Limit | Setting | Why |
+|---|---|---|
+| Longest session | `presence_max_session_seconds` | A cat that never leaves, a sensor gone wrong |
+| Rest between sessions | `presence_rest_seconds` | No rapid on/off of the relay |
+| Re-arm only after quiet | — | A session cut short (max length, budget, the app's stop button) does not restart while the same cat is still there: the next one waits for the score to drop below the off threshold |
+| Hourly budget | `presence_hourly_budget_seconds` | Hard cap on presence pouring per rolling hour |
+| Blanking | `PRESENCE_BLANK_MS` | `OUT` is ignored right after the pump switches — relay spikes |
+| Stuck sensor | `PRESENCE_STUCK_SECONDS` | `OUT` HIGH without a break is a fault (`presence_fault`), ignored until it drops |
+| Other runs | — | A session never starts while another run holds the pump, and only ever stops its own run |
+
+The decision lives in [src/presence_logic.c](src/presence_logic.c) (model described
+in [include/presence_logic.h](include/presence_logic.h)), kept free of ESP-IDF so it
+is unit-tested on a PC — see [Tests](#tests). The defaults come from a simulation of
+cat visits; `presence_score` in the status shows `x` live, which is what to watch
+when tuning `presence_hold_seconds`.
+
 ## REST API
 
 The board announces itself over mDNS as **`waterpump.local`**. If mDNS does not
@@ -125,32 +213,57 @@ on the LAN can run the pump.
 | Method | Path | Body | Notes |
 |---|---|---|---|
 | `GET` | `/api/status` | — | State, counters and current config |
+| `GET` | `/api/history` | — | Last 10 finished runs |
+| `GET` | `/api/presence/events` | — | Last 200 raw presence-sensor pulses |
 | `POST` | `/api/pump/on` | `{"seconds": 15}` | `seconds` optional → `manual_run_seconds` |
 | `POST` | `/api/pump/off` | — | Cuts a running cycle short; no-op when idle |
 | `GET` | `/api/config` | — | Current settings |
 | `POST` | `/api/config` | any subset of fields | Persists to NVS, re-arms the schedule |
 
-`GET /api/status` returns:
+### Status
+
+`GET /api/status` returns the live state plus the current config:
 
 ```json
 {
   "pumping": false, "seconds_left": 0, "seconds_total": 0,
-  "cycle_count": 12, "uptime_s": 43201, "wifi_rssi": -58,
-  "presence_detected": false, "next_run_in_s": 1740,
+  "cycle_count": 12, "uptime_s": 43201, "wifi_rssi": -58, "next_run_in_s": 1740,
+  "presence_detected": false, "presence_sensor_active": "pir",
+  "presence_sensor_responding": null, "presence_warming_up": false,
+  "restart_required": false,
+  "presence_score": 0.0, "presence_session": false, "presence_fault": false,
+  "presence_budget_used_seconds": 0,
   "mode": "interval", "schedule_enabled": false, "interval_seconds": 3600,
   "run_seconds": 1200, "manual_run_seconds": 30,
-  "presence_cooldown_seconds": 1800, "presence_max_gate": 8,
-  "presence_sensitivity": 50, "presence_no_one_seconds": 5
+  "presence_sensor": "pir", "presence_confirm_pulses": 1,
+  "presence_confirm_window_seconds": 10, "presence_hold_seconds": 15,
+  "presence_max_session_seconds": 300, "presence_rest_seconds": 10,
+  "presence_hourly_budget_seconds": 1200
 }
 ```
 
-`next_run_in_s` is how long until the next scheduled cycle, or `null` when the
-schedule is not active (see [Operating modes](#operating-modes)). While the pump
-runs, the status also carries `source` — `schedule`, `manual` or `presence`.
+- `next_run_in_s` — time to the next scheduled cycle, or `null` when the schedule is
+  not active (see [Operating modes](#operating-modes)). While the pump runs, the
+  status also carries `source`: `schedule`, `manual` or `presence`.
+- `presence_detected` — the sensor's live `OUT` reading, in every mode, so you can
+  see the sensor work before switching into `presence` mode.
+- `presence_sensor` is the configured sensor, `presence_sensor_active` the one this
+  boot runs; they differ, and `restart_required` is `true`, after a change that is
+  waiting for a restart.
+- `presence_sensor_responding` — `null` for a sensor that cannot be checked (a PIR),
+  otherwise whether the radar acked its last tuning push.
+- `presence_warming_up` — the PIR is inside its post-boot warm-up and is not acted on.
+- `presence_score` — the score `x` from [Presence mode](#presence-mode), two
+  decimals; `presence_session` — a presence session is pouring; `presence_fault` —
+  `OUT` is stuck HIGH and ignored; `presence_budget_used_seconds` — presence pouring
+  in the last hour.
 
-`GET /api/history` lists the last 10 finished runs, newest first. The board has no
-wall clock, so each start is given relative to now — the app turns it into a clock
-time. The history lives in RAM and starts empty after a reboot.
+### History and pulse log
+
+The board has no wall clock, so both give times relative to now and both live in
+RAM — a reboot starts them over.
+
+`GET /api/history` lists the last 10 finished runs, newest first:
 
 ```json
 {"runs": [
@@ -159,23 +272,58 @@ time. The history lives in RAM and starts empty after a reboot.
 ]}
 ```
 
-`presence_detected` is the sensor's live, debounced `OUT` reading — it updates
-regardless of `mode`, so you can see it work before switching into `presence` mode.
+`GET /api/presence/events` lists the sensor's last 200 raw `OUT` pulses, newest first,
+recorded in every mode at `PRESENCE_POLL_MS` resolution — the raw material for tuning
+presence mode. `high_ms` is `null` while the pulse is still HIGH; `pump_on` says
+whether the pump was running when it started, to spot pulses caused by the relay or
+pump; `seq` restarts at 0 after a reboot.
 
-`POST /api/config` accepts `interval_seconds`, `run_seconds`, `manual_run_seconds`,
-`mode` (`interval`, `on_demand`, `presence`), `schedule_enabled` (a JSON boolean),
-and the `presence_*` fields listed above. Omitted fields keep their value. **Out-of-range values are rejected with
-HTTP 400, never silently clamped** — a typo in the app surfaces as an error rather
-than as a surprise at the bowl. The rules: run times must be 1…`PUMP_MAX_ON_SECONDS`,
-the interval at least 60 s, a cycle must be shorter than its own interval,
-`presence_max_gate` must be 0…8, `presence_sensitivity` 0…100, and
-`presence_cooldown_seconds`/`presence_no_one_seconds` at least 1.
+```json
+{"uptime_ms": 43201000, "events": [
+  {"seq": 41, "rise_ago_ms": 5200, "high_ms": 2600, "pump_on": false}
+]}
+```
 
-A successful `presence_*` change is also pushed straight into the LD2410C over its
-UART (see [Adding the presence sensor](#adding-the-presence-sensor-presence-mode-only)) —
-if the sensor doesn't ack in time the HTTP call still succeeds (the setting is saved
-and used by the debounce logic either way), but a warning is logged and the sensor's
-own filtering may be stale until the next successful push.
+To keep more than 200 pulses, run
+[tools/collect_presence_events.py](tools/collect_presence_events.py) on any machine
+that can reach the board (or Posejdon). It polls the endpoint, converts times to wall
+clock, and appends each finished pulse to a JSONL file:
+
+```sh
+tools/collect_presence_events.py http://waterpump.local presence_events.jsonl
+```
+
+### Changing the config
+
+`POST /api/config` takes any subset of the fields below; omitted fields keep their
+value. **Out-of-range values are rejected with HTTP 400, never silently clamped** — a
+typo in the app surfaces as an error rather than as a surprise at the bowl. The
+response carries the new config and `restart_required`.
+
+| Field | Accepted | Notes |
+|---|---|---|
+| `mode` | `interval`, `on_demand`, `presence` | See [Operating modes](#operating-modes) |
+| `schedule_enabled` | `true` / `false` | Ignored in `interval` mode |
+| `interval_seconds` | ≥ 60 | Start to start |
+| `run_seconds` | 1…`PUMP_MAX_ON_SECONDS`, < `interval_seconds` | One scheduled cycle |
+| `manual_run_seconds` | 1…`PUMP_MAX_ON_SECONDS` | Default for `/api/pump/on` |
+| `presence_sensor` | `pir`, `ld2410` | Takes effect after a restart |
+| `presence_confirm_pulses` | 1 or 2 | Start on the first pulse, or on a second one |
+| `presence_confirm_window_seconds` | 1…60 | Window for the second pulse |
+| `presence_hold_seconds` | 1…300 | Decay time constant of the score |
+| `presence_max_session_seconds` | 1…`PUMP_MAX_ON_SECONDS` | Longest single session |
+| `presence_rest_seconds` | 0…3600 | Gap between sessions |
+| `presence_hourly_budget_seconds` | 1…3600 | Presence pouring per rolling hour |
+| `presence_max_gate` | 0…8 | Radar only, ~0.75 m per gate |
+| `presence_sensitivity` | 0…100 | Radar only, 0 = most sensitive |
+| `presence_no_one_seconds` | ≥ 1 | Radar only, its own "gone" timeout |
+
+The three radar fields appear in the config and are accepted only while
+`presence_sensor` is `ld2410` — checked against the sensor the request leaves
+configured, so `{"presence_sensor":"ld2410","presence_max_gate":2}` works in one
+call. With the radar running, a change to them is also pushed into the LD2410C over
+its UART; if the sensor doesn't ack in time the call still succeeds (the setting is
+saved), but a warning is logged and `presence_sensor_responding` turns `false`.
 
 ```sh
 curl http://waterpump.local/api/status
@@ -193,24 +341,52 @@ reset them; `pio run -t erase` does.
 [include/config.h](include/config.h) holds the wiring constants and the factory
 defaults used the first time the board boots with an empty NVS partition:
 
+**Wiring**
+
 | Constant | Default | Meaning |
 |---|---|---|
 | `RELAY_GPIO` | `27` | GPIO driving the relay's IN pin |
 | `RELAY_ACTIVE_LOW` | `1` | A LOW level energises the relay |
+| `PRESENCE_GPIO` | `33` | GPIO reading the presence sensor's `OUT` pin |
+| `PRESENCE_ACTIVE_HIGH` | `1` | HIGH on `OUT` means someone is present |
+| `LD2410_UART_TXD_GPIO` / `_RXD_GPIO` | `17` / `16` | Radar only: ESP32 pins wired to the sensor's `RX`/`TX` |
+
+**Watering**
+
+| Constant | Default | Meaning |
+|---|---|---|
 | `PUMP_ON_SECONDS` | `1200` | Run time of one scheduled cycle (20 min) |
 | `PUMP_INTERVAL_SECONDS` | `3600` | Gap between cycles (1 h) |
 | `PUMP_MANUAL_ON_SECONDS` | `30` | Default duration of a "pour now" request |
 | `RUN_ON_FIRST_BOOT` | `1` | Water on cold boot when the schedule is active, or wait one interval |
 | `PUMP_MAX_ON_SECONDS` | `1800` | Hard cap, enforced on every request (30 min) |
-| `PRESENCE_GPIO` | `33` | GPIO reading the LD2410C's `OUT` pin |
-| `PRESENCE_ACTIVE_HIGH` | `1` | HIGH on `OUT` means someone is present |
-| `PRESENCE_DEBOUNCE_SAMPLES` / `_MS` | `3` / `75` | Noise filtering for a presence reading |
+
+**Presence mode** — defaults for the API fields of the same name, see
+[Presence mode](#presence-mode)
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `PRESENCE_SENSOR_DEFAULT` | `PRESENCE_SENSOR_PIR` | Sensor assumed on first boot |
+| `PRESENCE_CONFIRM_PULSES` / `_WINDOW_SECONDS` | `1` / `10` | Start on the first pulse, or on a second one within the window |
+| `PRESENCE_HOLD_SECONDS` | `15` | Decay time constant of the score |
+| `PRESENCE_MAX_SESSION_SECONDS` | `300` | Longest single session |
+| `PRESENCE_REST_SECONDS` | `10` | Minimum gap between two sessions |
+| `PRESENCE_HOURLY_BUDGET_SECONDS` | `1200` | Presence pouring per rolling hour |
+| `LD2410_MAX_GATE` | `8` | Radar only: distance gate pushed to the sensor |
+| `LD2410_SENSITIVITY` | `50` | Radar only: sensitivity (0 most sensitive – 100 least) |
+| `LD2410_NO_ONE_SECONDS` | `5` | Radar only: its own "gone" timeout |
+
+**Presence mode, fixed** — not exposed over the API
+
+| Constant | Default | Meaning |
+|---|---|---|
 | `PRESENCE_POLL_MS` | `200` | How often the presence task samples `OUT` |
-| `PUMP_PRESENCE_COOLDOWN_SECONDS` | `1800` | Minimum gap between presence-triggered waterings (30 min) |
-| `LD2410_UART_TXD_GPIO` / `_RXD_GPIO` | `17` / `16` | ESP32 pins wired to the sensor's `RX`/`TX` |
-| `LD2410_MAX_GATE` | `8` | Factory default distance gate pushed to the sensor |
-| `LD2410_SENSITIVITY` | `50` | Factory default sensitivity (0 most sensitive – 100 least) |
-| `LD2410_NO_ONE_SECONDS` | `5` | Factory default "gone" timeout pushed to the sensor |
+| `PIR_WARMUP_SECONDS` | `60` | PIR only: `OUT` not acted on after boot |
+| `PRESENCE_TH_OFF` / `PRESENCE_X_MAX` | `0.3` / `4.0` | Score off-threshold and cap |
+| `PRESENCE_MIN_PULSE_MS` | `400` | `OUT` must be HIGH this long to count |
+| `PRESENCE_REEMIT_MS` | `2000` | A pulse still HIGH counts again this often |
+| `PRESENCE_BLANK_MS` | `1000` | `OUT` ignored after the pump switches |
+| `PRESENCE_STUCK_SECONDS` | `600` | `OUT` HIGH this long is a stuck sensor |
 
 WiFi credentials go in `include/wifi_secrets.h`, which is gitignored. Copy the
 template and fill it in:
@@ -223,26 +399,6 @@ Board-level settings (flash size, UART console, CPU frequency) are in
 [sdkconfig.defaults](sdkconfig.defaults), and the flash layout in
 [partitions.csv](partitions.csv) — the default single-app table caps the application
 at 1 MB, which this build nearly fills once WiFi, HTTP and mDNS are linked in.
-
-## Operating modes
-
-`mode` in the config selects what makes the pump run:
-
-- **`interval`** — pour `run_seconds` every `interval_seconds`. The schedule is
-  always on in this mode.
-- **`on_demand`** — pour when the app asks for it. Adds the schedule on top only if
-  `schedule_enabled` is `true`.
-- **`presence`** — pour when the **HLK-LD2410C** 24 GHz radar sees someone at the
-  bowl, debounced and cooldown-limited by [src/presence.c](src/presence.c). See
-  [How it works](#how-it-works) above. Adds the schedule on top only if
-  `schedule_enabled` is `true`; the schedule and the presence cooldown are
-  independent of each other.
-
-`POST /api/pump/on` works in every mode. `schedule_enabled` is stored but ignored in
-`interval` mode, so switching back to another mode restores whatever was set there.
-`interval_seconds` is measured from the start of one cycle to the start of the next:
-20 minutes of pumping followed by 60 minutes of rest is `run_seconds: 1200`,
-`interval_seconds: 4800`.
 
 ## Building
 
@@ -260,6 +416,18 @@ access.
 
 Most DevKit boards auto-reset into the bootloader via DTR/RTS. If yours doesn't: hold
 **BOOT (IO0)**, tap **EN/RST**, release BOOT.
+
+## Tests
+
+The presence-mode decision ([src/presence_logic.c](src/presence_logic.c)) has
+host-side tests covering a cat walking past, drinking, calm and repeated visits,
+the two-pulse confirmation, a stuck sensor, the app's stop button, the hourly
+budget, and mode changes. No board needed:
+
+```sh
+gcc -std=c11 -Wall -Wextra -Iinclude test/test_presence_logic.c src/presence_logic.c -lm \
+    -o /tmp/test_presence_logic && /tmp/test_presence_logic
+```
 
 ## Dry run — do this before connecting the pump
 
@@ -286,27 +454,29 @@ Most DevKit boards auto-reset into the bootloader via DTR/RTS. If yours doesn't:
 
 ### Presence sensor checkout (`presence` mode only)
 
-1. Wire the LD2410C as in
-   [Adding the presence sensor](#adding-the-presence-sensor-presence-mode-only).
-2. Flash and open the monitor. Expect a `ld2410: UART up on port 2 ...` line, and,
+1. Wire the sensor as in
+   [Adding the presence sensor](#adding-the-presence-sensor-presence-mode-only) and
+   make sure `presence_sensor` names it (restart after changing it). The boot log
+   names the active sensor: `presence: pir on GPIO 33 ...`.
+2. Radar only: in the monitor, expect a `ld2410: UART up on port 2 ...` line, and,
    a moment later, `pushed gate=... sensitivity=... no_one=...` confirming the sensor
    acked the boot-time config push. A timeout there means check the `TX`/`RX` wiring
    (they cross: ESP32 TX → sensor RX) before anything else.
 3. Wave a hand in front of the sensor and poll status:
    `curl http://waterpump.local/api/status` — `presence_detected` should flip to
    `true` while your hand is there, `false` shortly after, regardless of `mode`.
-4. Switch into presence mode with a short cooldown for testing:
-   `curl -X POST http://waterpump.local/api/config -d '{"mode":"presence","presence_cooldown_seconds":10}'`
-5. Trigger presence again. Expect a relay click and a `presence confirmed` log line,
-   then, after the cycle, `cooldown elapsed, re-armed` roughly `presence_cooldown_seconds`
-   later.
-6. While in cooldown, trigger presence again (keep your hand there) and confirm no
-   second click — the log should stay quiet on that front until re-armed.
-7. Try tightening sensitivity to see the sensor-side push take effect:
+4. Switch into presence mode:
+   `curl -X POST http://waterpump.local/api/config -d '{"mode":"presence"}'`
+   (after a reboot, wait out the PIR's warm-up first — `presence_warming_up: false`).
+5. Wave once. Expect a relay click and a `session start` log line within about half a
+   second, `presence_score` around 1–2 in the status, and `session end` some 20–30 s
+   after the pulse ends.
+6. Keep waving every few seconds: the pump must keep running and `presence_score`
+   stay up; stop, and it must end about half a minute later.
+7. Radar only: try tightening sensitivity to see the sensor-side push take effect:
    `curl -X POST http://waterpump.local/api/config -d '{"presence_sensitivity":10}'`
    should make a distant wave less likely to register.
-8. Restore your real `presence_cooldown_seconds` before running unattended, and set
-   `mode` back to whatever you actually want.
+8. Set `mode` back to whatever you actually want.
 
 ## Note on timing
 

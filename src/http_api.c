@@ -9,16 +9,17 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
-#include "ld2410_uart.h"
 #include "net.h"
 #include "presence.h"
+#include "presence_sensor.h"
 #include "pump.h"
 #include "pump_config.h"
 
 static const char *TAG = "api";
 
-// Request bodies are a handful of integers; anything larger is not ours.
-#define MAX_BODY_LEN 256
+// Request bodies are a handful of integers - a full config from the app is
+// ~400 bytes; anything much larger is not ours.
+#define MAX_BODY_LEN 768
 
 static esp_err_t send_json(httpd_req_t *req, int status, cJSON *root) {
 	char *body = cJSON_PrintUnformatted(root);
@@ -115,10 +116,27 @@ static void add_config_fields(cJSON *root, const pump_config_t *cfg) {
 	cJSON_AddNumberToObject(root, "interval_seconds", cfg->interval_seconds);
 	cJSON_AddNumberToObject(root, "run_seconds", cfg->run_seconds);
 	cJSON_AddNumberToObject(root, "manual_run_seconds", cfg->manual_run_seconds);
-	cJSON_AddNumberToObject(root, "presence_cooldown_seconds", cfg->presence_cooldown_seconds);
-	cJSON_AddNumberToObject(root, "presence_max_gate", cfg->presence_max_gate);
-	cJSON_AddNumberToObject(root, "presence_sensitivity", cfg->presence_sensitivity);
-	cJSON_AddNumberToObject(root, "presence_no_one_seconds", cfg->presence_no_one_seconds);
+	cJSON_AddStringToObject(root, "presence_sensor", presence_sensor_type_name(cfg->presence_sensor));
+	cJSON_AddNumberToObject(root, "presence_confirm_pulses", cfg->presence_confirm_pulses);
+	cJSON_AddNumberToObject(root, "presence_confirm_window_seconds",
+	                        cfg->presence_confirm_window_seconds);
+	cJSON_AddNumberToObject(root, "presence_hold_seconds", cfg->presence_hold_seconds);
+	cJSON_AddNumberToObject(root, "presence_max_session_seconds", cfg->presence_max_session_seconds);
+	cJSON_AddNumberToObject(root, "presence_rest_seconds", cfg->presence_rest_seconds);
+	cJSON_AddNumberToObject(root, "presence_hourly_budget_seconds",
+	                        cfg->presence_hourly_budget_seconds);
+	// Only the fields the configured sensor understands; the rest stay in NVS
+	// for when it is swapped back.
+	if (presence_sensor_for(cfg->presence_sensor)->has_tuning) {
+		cJSON_AddNumberToObject(root, "presence_max_gate", cfg->presence_max_gate);
+		cJSON_AddNumberToObject(root, "presence_sensitivity", cfg->presence_sensitivity);
+		cJSON_AddNumberToObject(root, "presence_no_one_seconds", cfg->presence_no_one_seconds);
+	}
+}
+
+// A sensor type saved over the API only takes over at the next boot.
+static bool restart_required(const pump_config_t *cfg) {
+	return cfg->presence_sensor != presence_active_sensor()->type;
 }
 
 static esp_err_t status_get_handler(httpd_req_t *req) {
@@ -135,6 +153,22 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
 	cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000));
 	cJSON_AddNumberToObject(root, "wifi_rssi", net_rssi());
 	cJSON_AddBoolToObject(root, "presence_detected", presence_is_detected());
+	const presence_sensor_t *sensor = presence_active_sensor();
+	cJSON_AddStringToObject(root, "presence_sensor_active", presence_sensor_type_name(sensor->type));
+	if (sensor->responding == NULL) {
+		cJSON_AddNullToObject(root, "presence_sensor_responding");
+	} else {
+		cJSON_AddBoolToObject(root, "presence_sensor_responding", sensor->responding());
+	}
+	cJSON_AddBoolToObject(root, "presence_warming_up", presence_warming_up());
+	presence_status_t pres;
+	presence_get_status(&pres);
+	// Rounded: the score is for watching it rise and decay, not for maths.
+	cJSON_AddNumberToObject(root, "presence_score", (double)((int)(pres.score * 100.0f + 0.5f)) / 100.0);
+	cJSON_AddBoolToObject(root, "presence_session", pres.session);
+	cJSON_AddBoolToObject(root, "presence_fault", pres.fault);
+	cJSON_AddNumberToObject(root, "presence_budget_used_seconds", pres.budget_used_s);
+	cJSON_AddBoolToObject(root, "restart_required", restart_required(&cfg));
 	if (state.pumping) {
 		cJSON_AddStringToObject(root, "source", pump_source_name(state.source));
 	}
@@ -168,6 +202,37 @@ static esp_err_t history_get_handler(httpd_req_t *req) {
 		cJSON_AddBoolToObject(run, "stopped_early", entries[i].stopped_early);
 		cJSON_AddItemToArray(runs, run);
 	}
+	return send_json(req, 200, root);
+}
+
+// Raw PIR pulses for offline analysis. Times go out relative to now, like
+// /api/history; `seq` plus `uptime_ms` let a poller de-duplicate across calls
+// and notice a reboot (uptime going backwards resets seq).
+static esp_err_t presence_events_get_handler(httpd_req_t *req) {
+	// Too big for the httpd task's stack.
+	presence_event_t *events = malloc(sizeof(presence_event_t) * PRESENCE_EVENT_LOG_LEN);
+	if (events == NULL) {
+		return send_error(req, 503, "out of memory");
+	}
+	size_t n = presence_get_events(events, PRESENCE_EVENT_LOG_LEN);
+	int64_t now_us = esp_timer_get_time();
+
+	cJSON *root = cJSON_CreateObject();
+	cJSON_AddNumberToObject(root, "uptime_ms", (double)(now_us / 1000));
+	cJSON *list = cJSON_AddArrayToObject(root, "events");
+	for (size_t i = 0; i < n; i++) {
+		cJSON *ev = cJSON_CreateObject();
+		cJSON_AddNumberToObject(ev, "seq", events[i].seq);
+		cJSON_AddNumberToObject(ev, "rise_ago_ms", (double)((now_us - events[i].rise_us) / 1000));
+		if (events[i].ongoing) {
+			cJSON_AddNullToObject(ev, "high_ms");
+		} else {
+			cJSON_AddNumberToObject(ev, "high_ms", events[i].high_ms);
+		}
+		cJSON_AddBoolToObject(ev, "pump_on", events[i].pump_on);
+		cJSON_AddItemToArray(list, ev);
+	}
+	free(events);
 	return send_json(req, 200, root);
 }
 
@@ -239,17 +304,57 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
 	if (!get_uint_field(body, "interval_seconds", &cfg.interval_seconds, &found, &bad_field) ||
 	    !get_uint_field(body, "run_seconds", &cfg.run_seconds, &found, &bad_field) ||
 	    !get_uint_field(body, "manual_run_seconds", &cfg.manual_run_seconds, &found, &bad_field) ||
-	    !get_uint_field(body, "presence_cooldown_seconds", &cfg.presence_cooldown_seconds, &found,
+	    !get_uint_field(body, "presence_confirm_pulses", &cfg.presence_confirm_pulses, &found,
 	                    &bad_field) ||
-	    !get_uint_field(body, "presence_max_gate", &cfg.presence_max_gate, &found, &bad_field) ||
-	    !get_uint_field(body, "presence_sensitivity", &cfg.presence_sensitivity, &found,
+	    !get_uint_field(body, "presence_confirm_window_seconds",
+	                    &cfg.presence_confirm_window_seconds, &found, &bad_field) ||
+	    !get_uint_field(body, "presence_hold_seconds", &cfg.presence_hold_seconds, &found,
 	                    &bad_field) ||
-	    !get_uint_field(body, "presence_no_one_seconds", &cfg.presence_no_one_seconds, &found,
-	                    &bad_field)) {
+	    !get_uint_field(body, "presence_max_session_seconds", &cfg.presence_max_session_seconds,
+	                    &found, &bad_field) ||
+	    !get_uint_field(body, "presence_rest_seconds", &cfg.presence_rest_seconds, &found,
+	                    &bad_field) ||
+	    !get_uint_field(body, "presence_hourly_budget_seconds",
+	                    &cfg.presence_hourly_budget_seconds, &found, &bad_field)) {
 		cJSON_Delete(body);
 		char msg[80];
 		snprintf(msg, sizeof(msg), "%s must be a non-negative number", bad_field);
 		return send_error(req, 400, msg);
+	}
+
+	const cJSON *sensor_item = cJSON_GetObjectItemCaseSensitive(body, "presence_sensor");
+	if (sensor_item != NULL && !cJSON_IsNull(sensor_item)) {
+		if (!cJSON_IsString(sensor_item) ||
+		    !presence_sensor_type_from_name(sensor_item->valuestring, &cfg.presence_sensor)) {
+			cJSON_Delete(body);
+			return send_error(req, 400, "presence_sensor must be pir or ld2410");
+		}
+	}
+
+	// Sensor tuning, checked against the sensor this request leaves configured
+	// - so switching to the radar and setting its range can go in one call.
+	struct {
+		const char *name;
+		uint32_t *field;
+	} tuning[] = {
+		{"presence_max_gate", &cfg.presence_max_gate},
+		{"presence_sensitivity", &cfg.presence_sensitivity},
+		{"presence_no_one_seconds", &cfg.presence_no_one_seconds},
+	};
+	bool has_tuning = presence_sensor_for(cfg.presence_sensor)->has_tuning;
+	for (size_t i = 0; i < sizeof(tuning) / sizeof(tuning[0]); i++) {
+		char msg[80];
+		if (!get_uint_field(body, tuning[i].name, tuning[i].field, &found, &bad_field)) {
+			cJSON_Delete(body);
+			snprintf(msg, sizeof(msg), "%s must be a non-negative number", bad_field);
+			return send_error(req, 400, msg);
+		}
+		if (found && !has_tuning) {
+			cJSON_Delete(body);
+			snprintf(msg, sizeof(msg), "%s is not supported by %s", tuning[i].name,
+			         presence_sensor_type_name(cfg.presence_sensor));
+			return send_error(req, 400, msg);
+		}
 	}
 
 	if (!get_bool_field(body, "schedule_enabled", &cfg.schedule_enabled, &found, &bad_field)) {
@@ -277,11 +382,12 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
 	}
 	pump_apply_config(&cfg);
 	// Best-effort: the sensor being unreachable shouldn't fail a config save
-	// that otherwise took - presence_init()'s debounce still runs off cfg.
-	ld2410_uart_apply_config(&cfg);
+	// that otherwise took - presence mode runs off cfg either way.
+	presence_apply_config(&cfg);
 
 	cJSON *root = cJSON_CreateObject();
 	cJSON_AddBoolToObject(root, "ok", true);
+	cJSON_AddBoolToObject(root, "restart_required", restart_required(&cfg));
 	add_config_fields(root, &cfg);
 	return send_json(req, 200, root);
 }
@@ -289,7 +395,10 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
 esp_err_t http_api_start(void) {
 	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 	config.lru_purge_enable = true;
-	// Three GETs and three POSTs, registered below.
+	// Handlers keep a MAX_BODY_LEN buffer and the config on the stack; the
+	// 4 KB default leaves too little headroom for cJSON on top.
+	config.stack_size = 6144;
+	// Four GETs and three POSTs, registered below.
 	config.max_uri_handlers = 8;
 
 	httpd_handle_t server = NULL;
@@ -302,6 +411,7 @@ esp_err_t http_api_start(void) {
 	static const httpd_uri_t routes[] = {
 		{.uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler},
 		{.uri = "/api/history", .method = HTTP_GET, .handler = history_get_handler},
+		{.uri = "/api/presence/events", .method = HTTP_GET, .handler = presence_events_get_handler},
 		{.uri = "/api/pump/on", .method = HTTP_POST, .handler = pump_on_handler},
 		{.uri = "/api/pump/off", .method = HTTP_POST, .handler = pump_off_handler},
 		{.uri = "/api/config", .method = HTTP_GET, .handler = config_get_handler},

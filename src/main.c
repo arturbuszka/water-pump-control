@@ -5,7 +5,6 @@
 
 #include "config.h"
 #include "http_api.h"
-#include "ld2410_uart.h"
 #include "net.h"
 #include "presence.h"
 #include "pump.h"
@@ -39,17 +38,7 @@ void app_main(void) {
 	ESP_LOGI(TAG, "GPIO %d, active %s, mode %s", RELAY_GPIO, RELAY_ACTIVE_LOW ? "LOW" : "HIGH",
 	         pump_mode_name(cfg.mode));
 
-	ESP_ERROR_CHECK(presence_init());
-
-	esp_err_t ld2410_err = ld2410_uart_init();
-	if (ld2410_err == ESP_OK) {
-		// Best-effort: a sensor that isn't wired up yet, or doesn't ack in
-		// time, shouldn't stop the board from watering on schedule.
-		ld2410_uart_apply_config(&cfg);
-	} else {
-		ESP_LOGW(TAG, "LD2410C UART init failed (%s), skipping sensor tuning",
-		         esp_err_to_name(ld2410_err));
-	}
+	ESP_ERROR_CHECK(presence_init(&cfg));
 
 	ESP_ERROR_CHECK(net_init());
 	ESP_ERROR_CHECK(http_api_start());

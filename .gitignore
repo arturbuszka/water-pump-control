@@ -13,3 +13,4 @@ include/wifi_secrets.h
 # Pulled from the ESP Component Registry by the build.
 managed_components/
 dependencies.lock
+hardware/

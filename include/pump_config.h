@@ -16,10 +16,20 @@ typedef enum {
 	PUMP_MODE_INTERVAL = 0,
 	// Water when the app asks for it; the schedule only if schedule_enabled.
 	PUMP_MODE_ON_DEMAND = 1,
-	// Water when the HLK-LD2410C radar sees a cat at the bowl; the schedule
+	// Water when the presence sensor sees a cat at the bowl; the schedule
 	// only if schedule_enabled.
 	PUMP_MODE_PRESENCE = 2,
 } pump_mode_t;
+
+// Which sensor sits on PRESENCE_GPIO. Each has a driver in src/sensor_*.c
+// behind the interface in presence_sensor.h. Read once at boot, so changing it
+// takes a restart.
+typedef enum {
+	// Passive infrared motion sensor: OUT only, nothing to configure.
+	PRESENCE_SENSOR_PIR = 0,
+	// HLK-LD2410C 24 GHz radar: OUT plus a UART for range/sensitivity tuning.
+	PRESENCE_SENSOR_LD2410 = 1,
+} presence_sensor_type_t;
 
 typedef struct {
 	pump_mode_t mode;
@@ -33,12 +43,24 @@ typedef struct {
 	// How long a "pour now" request runs when it does not name its own duration.
 	uint32_t manual_run_seconds;
 
-	// PUMP_MODE_PRESENCE only, below. Also pushed into the LD2410C itself over
-	// its UART - see ld2410_uart.h - so the radar's own filtering matches what
-	// the app configured, not just the debounce on our side.
+	// PUMP_MODE_PRESENCE only, below.
 
-	// Minimum gap between two presence-triggered waterings.
-	uint32_t presence_cooldown_seconds;
+	// The sensor wired to PRESENCE_GPIO; takes effect on the next boot.
+	presence_sensor_type_t presence_sensor;
+	// How sensor pulses become pouring - see presence_logic.h and the
+	// PRESENCE_* defaults in config.h for what each one does.
+	uint32_t presence_confirm_pulses;      // 1 or 2
+	uint32_t presence_confirm_window_seconds;
+	uint32_t presence_hold_seconds;
+	uint32_t presence_max_session_seconds;
+	uint32_t presence_rest_seconds;
+	uint32_t presence_hourly_budget_seconds;
+
+	// LD2410C tuning, pushed into the radar over its UART - see ld2410_uart.h -
+	// so its own filtering matches what the app configured. Kept in NVS whatever
+	// the sensor, so switching back to the radar restores them; the API only
+	// exposes them while the radar is the configured sensor.
+
 	// Distance gates 0..8 the sensor should look across.
 	uint32_t presence_max_gate;
 	// Sensitivity per gate, 0 (most sensitive) - 100 (least).
@@ -50,6 +72,12 @@ typedef struct {
 // Shortest interval we accept. Anything faster is a misconfiguration rather
 // than a watering schedule, and would keep the pump running near-continuously.
 #define PUMP_MIN_INTERVAL_SECONDS 60
+
+// Bounds for the presence-mode fields. Wide enough to experiment with, narrow
+// enough that a typo can't make the score meaningless.
+#define PRESENCE_CONFIRM_WINDOW_MAX 60
+#define PRESENCE_HOLD_MAX 300
+#define PRESENCE_REST_MAX 3600
 
 // Bounds for the LD2410C tuning fields, straight from the sensor's protocol.
 #define LD2410_MAX_GATE_LIMIT 8
@@ -76,3 +104,7 @@ static inline bool pump_schedule_active(const pump_config_t *cfg) {
 // unknown name rather than silently picking a default.
 const char *pump_mode_name(pump_mode_t mode);
 bool pump_mode_from_name(const char *name, pump_mode_t *out_mode);
+
+// Same for the sensor type.
+const char *presence_sensor_type_name(presence_sensor_type_t type);
+bool presence_sensor_type_from_name(const char *name, presence_sensor_type_t *out_type);

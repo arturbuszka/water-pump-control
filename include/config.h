@@ -9,15 +9,25 @@
 // If the relay clicks opposite to what the logs say, flip this to 0.
 #define RELAY_ACTIVE_LOW 1
 
-// GPIO reading the HLK-LD2410C's OUT pin: a simple HIGH/LOW "someone is
-// there" signal, used by the presence trigger task.
+// GPIO reading the presence sensor's OUT pin: a simple HIGH/LOW "someone is
+// there" signal, used by the presence trigger task. Both supported sensors
+// (see presence_sensor_type_t) put it on this same pin.
 #define PRESENCE_GPIO 33
 
-// The LD2410C's OUT pin is active-HIGH (HIGH = target present) on stock
-// firmware. Flip to 0 if the dry run shows the opposite.
+// OUT is active-HIGH (HIGH = target present) on both the PIR and the stock
+// LD2410C firmware. Flip to 0 if the dry run shows the opposite.
 #define PRESENCE_ACTIVE_HIGH 1
 
-// The sensor's TX/RX pins, wired to a second UART (distinct from the UART0
+// Sensor assumed on first boot with an empty NVS; changed later over the API
+// (`presence_sensor`), which takes effect after a restart.
+#define PRESENCE_SENSOR_DEFAULT PRESENCE_SENSOR_PIR
+
+// PIR only: how long after boot OUT is ignored for triggering. PIR modules
+// settle for 30-60 s after power-up and can pulse HIGH meanwhile, which would
+// otherwise pour on every reboot in presence mode.
+#define PIR_WARMUP_SECONDS 60
+
+// LD2410C only: the sensor's TX/RX pins, wired to a second UART (distinct from the UART0
 // console) so the board can push sensitivity/range configuration into it.
 // Wiring: ESP32 TXD -> LD2410C RX, ESP32 RXD -> LD2410C TX (crossed, as usual).
 #define LD2410_UART_PORT UART_NUM_2
@@ -46,19 +56,60 @@
 // full interval later, so a reset loop can't flood the plants.
 #define RUN_ON_FIRST_BOOT 1
 
-// PUMP_MODE_PRESENCE only: minimum gap between two presence-triggered
-// waterings, in seconds. Stops one long visit (or a cat that won't leave)
-// from re-triggering the pump over and over. 60 * 30 = 30 min.
-#define PUMP_PRESENCE_COOLDOWN_SECONDS (60 * 30)
+// ---- Presence mode: factory defaults ----
+//
+// How presence mode turns sensor pulses into pouring - the model is described
+// in include/presence_logic.h. These are changed over the API like the cycle
+// settings above.
 
-// PUMP_MODE_PRESENCE only: consecutive PRESENCE_GPIO reads, PRESENCE_DEBOUNCE_MS
-// apart, that must all agree before a detection is treated as real rather than
-// noise at the edge of the sensor's range.
-#define PRESENCE_DEBOUNCE_SAMPLES 3
-#define PRESENCE_DEBOUNCE_MS 75
+// 1 = pour on the first pulse; 2 = wait for a second one within
+// PRESENCE_CONFIRM_WINDOW_SECONDS (ignores a cat just walking past, at the
+// cost of a few seconds' delay).
+#define PRESENCE_CONFIRM_PULSES 1
+#define PRESENCE_CONFIRM_WINDOW_SECONDS 10
 
-// How often the presence task polls PRESENCE_GPIO while armed.
+// Decay time constant of the presence score: how long a pulse is "remembered".
+// After the last pulse the pump keeps going for hold * ln(score / 0.3) -
+// roughly 18 s after a single pulse, up to ~39 s after a drinking session.
+#define PRESENCE_HOLD_SECONDS 15
+
+// One presence session never pours longer than this.
+#define PRESENCE_MAX_SESSION_SECONDS (60 * 5)
+
+// Minimum gap between the end of one session and the start of the next.
+#define PRESENCE_REST_SECONDS 10
+
+// Presence pouring allowed per rolling hour, whatever the sensor says.
+#define PRESENCE_HOURLY_BUDGET_SECONDS (60 * 20)
+
+// ---- Presence mode: fixed tuning ----
+//
+// Settled in simulation (score thresholds) or by the hardware (timings); not
+// exposed over the API.
+
+// How often the presence task samples PRESENCE_GPIO.
 #define PRESENCE_POLL_MS 200
+
+// Score hysteresis: a session ends below PRESENCE_TH_OFF; the score is capped
+// at PRESENCE_X_MAX so a long visit can't keep the pump going minutes after.
+#define PRESENCE_TH_OFF 0.3f
+#define PRESENCE_X_MAX 4.0f
+
+// OUT must stay HIGH this long to count at all - filters spikes, while every
+// real PIR or radar pulse lasts far longer.
+#define PRESENCE_MIN_PULSE_MS 400
+
+// While OUT stays HIGH it counts as a fresh pulse this often, so a sensor that
+// holds OUT HIGH through continuous motion keeps the score up.
+#define PRESENCE_REEMIT_MS 2000
+
+// OUT is ignored this long after the pump switches on or off - relay and pump
+// can couple a spike into the sensor lead.
+#define PRESENCE_BLANK_MS 1000
+
+// OUT HIGH without a break this long is treated as a stuck sensor: the session
+// stops and the sensor is ignored until OUT goes LOW again.
+#define PRESENCE_STUCK_SECONDS (60 * 10)
 
 // ---- LD2410C radar tuning: factory defaults ----
 //
