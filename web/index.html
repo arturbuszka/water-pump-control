@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fontanna</title>
+<link rel="icon" href="data:,">
+<style>
+:root { color-scheme: light dark; --fg: #1a1a1a; --bg: #f4f4f4; --card: #fff; --muted: #777; --line: #ddd; --accent: #0e7490; --err: #b91c1c; }
+@media (prefers-color-scheme: dark) { :root { --fg: #eee; --bg: #111; --card: #1c1c1c; --muted: #999; --line: #333; --accent: #22a3c4; --err: #f87171; } }
+* { box-sizing: border-box; }
+body { margin: 0 auto; max-width: 32rem; padding: 1rem; font: 16px/1.4 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+h2 { font-size: 1.05rem; margin: 0 0 .5rem; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+.muted { color: var(--muted); }
+.small { font-size: .85rem; }
+.err { color: var(--err); }
+#summary { font-weight: 600; font-size: 1.1rem; }
+#summary::before { content: "●"; margin-right: .4rem; color: var(--muted); }
+#summary.pumping::before { color: var(--accent); }
+#summary.idle::before { color: #16a34a; }
+progress { width: 100%; margin-top: .5rem; }
+dl { margin: .75rem 0 0; }
+dl div { display: flex; justify-content: space-between; gap: 1rem; padding: .25rem 0; border-top: 1px solid var(--line); }
+dt { color: var(--muted); }
+dd { margin: 0; text-align: right; }
+button { font: inherit; padding: .7rem 1rem; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--fg); width: 100%; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button:disabled { opacity: .5; }
+.buttons { display: flex; gap: .5rem; margin-top: .75rem; }
+input[type=range] { width: 100%; }
+ol { margin: 0; padding: 0; list-style: none; }
+ol li { display: flex; justify-content: space-between; gap: 1rem; padding: .3rem 0; border-top: 1px solid var(--line); }
+ol li span:first-child { white-space: nowrap; }
+ol li span:last-child { text-align: right; }
+summary { cursor: pointer; font-weight: 600; }
+label { display: block; margin-top: .75rem; }
+label > span { display: block; }
+label small { display: block; color: var(--muted); font-size: .8rem; }
+label.check { display: flex; gap: .5rem; align-items: center; }
+input:not([type]), input[type=time], select { font: inherit; width: 100%; padding: .4rem; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); color: var(--fg); }
+fieldset { border: 1px solid var(--line); border-radius: 6px; margin: 1rem 0 0; }
+#save { margin-top: 1rem; }
+#toast { position: fixed; left: 1rem; right: 1rem; bottom: 1rem; max-width: 30rem; margin: 0 auto; padding: .75rem 1rem; border-radius: 6px; background: #222; color: #fff; opacity: 0; transition: opacity .2s; pointer-events: none; }
+#toast.show { opacity: 1; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<h1>Fontanna</h1>
+
+<div class="card">
+  <div id="summary">Łączenie…</div>
+  <progress id="progress" max="1" value="0" hidden></progress>
+  <dl id="details" hidden>
+    <div><dt>Tryb</dt><dd id="d-mode"></dd></div>
+    <div id="d-next-row"><dt>Następne lanie</dt><dd id="d-next"></dd></div>
+    <div id="d-interval-row"><dt>Interwał</dt><dd id="d-interval"></dd></div>
+    <div id="d-run-row"><dt>Czas cyklu</dt><dd id="d-run"></dd></div>
+    <div id="d-quiet-row"><dt>Cisza nocna</dt><dd id="d-quiet"></dd></div>
+    <div id="d-presence-row"><dt>Czujnik obecności</dt><dd id="d-presence"></dd></div>
+    <div id="d-score-row"><dt>Wynik obecności</dt><dd id="d-score"></dd></div>
+    <div><dt>Cykli od startu</dt><dd id="d-cycles"></dd></div>
+    <div><dt>Czas pracy</dt><dd id="d-uptime"></dd></div>
+    <div><dt>Sygnał WiFi</dt><dd id="d-rssi"></dd></div>
+  </dl>
+</div>
+
+<div class="card">
+  <label for="duration">Lej teraz: <strong id="duration-value">30 s</strong></label>
+  <input id="duration" type="range" min="1" max="120" step="1" value="30">
+  <div class="buttons">
+    <button id="pour" class="primary">Lej teraz</button>
+    <button id="stop" disabled>Zatrzymaj</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Ostatnie cykle</h2>
+  <ol id="history"></ol>
+  <p id="history-empty" class="muted small">Brak cykli od uruchomienia płytki.</p>
+</div>
+
+<details class="card" id="settings">
+  <summary>Ustawienia</summary>
+  <form id="form" novalidate>
+    <p id="form-error" class="err" hidden></p>
+
+    <label><span>Tryb pracy</span>
+      <select name="mode">
+        <option value="interval">Interwałowy</option>
+        <option value="on_demand">Na żądanie</option>
+        <option value="presence">Czujnik obecności</option>
+      </select>
+    </label>
+
+    <label class="check" id="schedule-toggle">
+      <input type="checkbox" name="schedule_enabled"> Dodatkowo podlewaj według harmonogramu
+    </label>
+
+    <div id="schedule-fields">
+      <label><span>Interwał (minuty)</span>
+        <input name="interval_minutes" inputmode="numeric">
+        <small>Co ile pompa leje sama, licząc od startu do startu</small>
+      </label>
+      <label><span>Czas cyklu (sekundy)</span>
+        <input name="run_seconds" inputmode="numeric">
+        <small>Jak długo trwa jedno lanie z harmonogramu</small>
+      </label>
+    </div>
+
+    <label><span>Czas lania na żądanie (sekundy)</span>
+      <input name="manual_run_seconds" inputmode="numeric">
+      <small>Domyślny czas przycisku „Lej teraz”</small>
+    </label>
+
+    <fieldset>
+      <legend>Cisza nocna</legend>
+      <label class="check">
+        <input type="checkbox" name="quiet_enabled"> Nie uruchamiaj pompy w wybranych godzinach
+      </label>
+      <div id="quiet-times">
+        <label><span>Od godziny</span><input name="quiet_start" type="time"></label>
+        <label><span>Do godziny</span><input name="quiet_end" type="time">
+          <small>Ani czujnik, ani harmonogram nie uruchomią wtedy pompy. „Lej teraz” działa zawsze.</small>
+        </label>
+      </div>
+    </fieldset>
+
+    <fieldset id="presence-fields">
+      <legend>Czujnik obecności</legend>
+      <label><span>Podłączony czujnik</span>
+        <select name="presence_sensor">
+          <option value="pir">PIR (czujnik ruchu)</option>
+          <option value="ld2410">Radar HLK-LD2410C</option>
+        </select>
+        <small>Zmiana zadziała dopiero po restarcie płytki</small>
+      </label>
+      <label><span>Kiedy zacząć lać</span>
+        <select name="presence_confirm_pulses">
+          <option value="1">Od razu po pierwszym ruchu</option>
+          <option value="2">Po drugim ruchu (pomija przechodzącego kota)</option>
+        </select>
+      </label>
+      <label id="confirm-window-field"><span>Okno na drugi ruch (sekundy)</span>
+        <input name="presence_confirm_window_seconds" inputmode="numeric">
+        <small>W jakim czasie od pierwszego ruchu musi przyjść drugi</small>
+      </label>
+      <label><span>Pamięć ruchu (sekundy)</span>
+        <input name="presence_hold_seconds" inputmode="numeric">
+        <small>Im więcej, tym dłużej leje po ostatnim ruchu: ok. 1,2× tej wartości po pojedynczym ruchu, do ok. 2,6× po dłuższej wizycie</small>
+      </label>
+      <label><span>Najdłuższe lanie na jedną wizytę (sekundy)</span>
+        <input name="presence_max_session_seconds" inputmode="numeric">
+        <small>Potem pompa czeka, aż kot odejdzie</small>
+      </label>
+      <label><span>Przerwa po laniu (sekundy)</span>
+        <input name="presence_rest_seconds" inputmode="numeric">
+        <small>Najkrótszy odstęp między końcem jednego lania a startem następnego</small>
+      </label>
+      <label><span>Limit lania na godzinę (minuty)</span>
+        <input name="presence_hourly_budget_minutes" inputmode="numeric">
+        <small>Twardy limit niezależny od czujnika</small>
+      </label>
+      <div id="ld2410-fields">
+        <p class="muted small">Te ustawienia trafiają też bezpośrednio do radaru przez UART.</p>
+        <label><span>Zasięg (bramka 0–8)</span>
+          <input name="presence_max_gate" inputmode="numeric">
+          <small>Jak daleko radar patrzy, każda bramka to ~0,75 m</small>
+        </label>
+        <label><span>Czułość (0–100)</span>
+          <input name="presence_sensitivity" inputmode="numeric">
+          <small>0 = najbardziej czuły, 100 = najmniej czuły</small>
+        </label>
+        <label><span>Czas do „nikogo nie ma” (sekundy)</span>
+          <input name="presence_no_one_seconds" inputmode="numeric">
+          <small>Jak długo brak ruchu, zanim czujnik uzna, że kot odszedł</small>
+        </label>
+      </div>
+    </fieldset>
+
+    <button type="submit" id="save" class="primary">Zapisz</button>
+  </form>
+</details>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+'use strict';
+
+// The firmware does not push changes, so status is polled - only while the
+// page is visible, so a phone in a pocket does not keep the board busy.
+const POLL_MS = 2000;
+const REQUEST_TIMEOUT_MS = 8000;
+
+const MODE_LABELS = { interval: 'Interwałowy', on_demand: 'Na żądanie', presence: 'Czujnik obecności' };
+const SENSOR_LABELS = { pir: 'PIR', ld2410: 'radar' };
+const SOURCE_LABELS = { schedule: 'harmonogram', manual: 'ręcznie', presence: 'czujnik' };
+
+const $ = (id) => document.getElementById(id);
+
+const state = {
+  status: null, // null = unknown
+  busy: false,
+  // The slider follows manual_run_seconds from the board until the user moves it.
+  sliderTouched: false,
+  // History is refetched only when this changes - a run started or ended.
+  historyKey: null,
+};
+
+let pollTimer = null;
+let pollSeq = 0;
+
+// ---------- API ----------
+
+async function api(path, { method = 'GET', body } = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+  let resp;
+  try {
+    resp = await fetch(path, {
+      method,
+      // The firmware rejects POSTs without this header, so the body is always sent as JSON.
+      headers: method === 'POST' ? { 'Content-Type': 'application/json' } : undefined,
+      body: method === 'POST' ? JSON.stringify(body || {}) : undefined,
+      signal: ctrl.signal,
+      cache: 'no-store',
+    });
+  } catch {
+    throw new Error('Brak połączenia z płytką');
+  } finally {
+    clearTimeout(timer);
+  }
+  let data = {};
+  try { data = await resp.json(); } catch { /* empty or non-JSON body - the status code is enough */ }
+  if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+  return data;
+}
+
+// ---------- Formatting ----------
+
+// Same as pump_schedule_active() in the firmware.
+const scheduleActive = (cfg) => cfg.mode === 'interval' || !!cfg.schedule_enabled;
+
+function formatUptime(s) {
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}min`;
+  return `${m}min`;
+}
+
+function formatInterval(s) {
+  if (s >= 3600 && s % 3600 === 0) return `${s / 3600} h`;
+  if (s >= 60) return `${Math.floor(s / 60)} min`;
+  return `${s} s`;
+}
+
+function formatDuration(s) {
+  if (s < 60) return `${s} s`;
+  const m = Math.floor(s / 60), r = s % 60;
+  return r ? `${m} min ${r} s` : `${m} min`;
+}
+
+function formatLeft(s) {
+  if (s < 60) return `${s} s`;
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+// The board reports times relative to now; the phone's clock turns them into clock times.
+function formatClock(date) {
+  const time = date.toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  if (date.toDateString() === today.toDateString()) return time;
+  if (date.toDateString() === yesterday.toDateString()) return `wczoraj ${time}`;
+  return `${date.toLocaleDateString('pl-PL', { day: '2-digit', month: '2-digit' })} ${time}`;
+}
+
+// Minutes since midnight (as the firmware stores them) <-> HH:MM (as <input type="time"> wants).
+function minutesToTime(min) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(Math.floor(min / 60))}:${pad(min % 60)}`;
+}
+
+function timeToMinutes(value) {
+  const m = /^(\d{2}):(\d{2})/.exec(value);
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+}
+
+// ---------- Render ----------
+
+function show(id, visible) { $(id).hidden = !visible; }
+
+function renderStatus() {
+  const s = state.status;
+  const summary = $('summary');
+  summary.className = s ? (s.pumping ? 'pumping' : 'idle') : '';
+
+  let text = 'Brak połączenia';
+  if (s) {
+    const why = SOURCE_LABELS[s.source] ? ` (${SOURCE_LABELS[s.source]})` : '';
+    if (s.pumping) text = s.seconds_left > 0 ? `Leje${why} – zostało ${formatLeft(s.seconds_left)}` : `Leje${why}`;
+    else if (s.quiet_active) text = `Cisza nocna do ${minutesToTime(s.quiet_end_minute)}`;
+    else text = 'Bezczynna';
+  }
+  summary.textContent = text;
+
+  const showProgress = !!(s && s.pumping && s.seconds_total > 0);
+  show('progress', showProgress);
+  if (showProgress) $('progress').value = (s.seconds_total - s.seconds_left) / s.seconds_total;
+
+  show('details', !!s);
+  if (s) {
+    $('d-mode').textContent = MODE_LABELS[s.mode] || s.mode;
+
+    const hasNext = typeof s.next_run_in_s === 'number';
+    show('d-next-row', hasNext);
+    if (hasNext) {
+      const at = new Date(Date.now() + s.next_run_in_s * 1000);
+      const left = s.next_run_in_s < 60 ? 'za chwilę' : `za ${formatInterval(s.next_run_in_s)}`;
+      $('d-next').textContent = `${formatClock(at)} (${left})`;
+    }
+
+    const scheduled = scheduleActive(s);
+    show('d-interval-row', scheduled);
+    show('d-run-row', scheduled);
+    $('d-interval').textContent = formatInterval(s.interval_seconds);
+    $('d-run').textContent = `${s.run_seconds} s`;
+
+    show('d-quiet-row', s.quiet_enabled);
+    if (s.quiet_enabled) $('d-quiet').textContent = quietText(s);
+
+    show('d-presence-row', s.mode === 'presence');
+    $('d-presence').textContent = presenceText(s);
+    show('d-score-row', s.mode === 'presence');
+    $('d-score').textContent = `${s.presence_score.toFixed(2)}`
+      + (s.presence_session ? ' · leje' : '')
+      + ` · limit ${Math.round(s.presence_budget_used_seconds / 60)}/${Math.round(s.presence_hourly_budget_seconds / 60)} min`;
+
+    $('d-cycles').textContent = String(s.cycle_count);
+    $('d-uptime').textContent = formatUptime(s.uptime_s);
+    $('d-rssi').textContent = `${s.wifi_rssi} dBm`;
+
+    if (!state.sliderTouched && !state.busy && s.manual_run_seconds > 0) setSlider(s.manual_run_seconds);
+  }
+  renderControls();
+}
+
+function quietText(s) {
+  // Without the time of day the board acts as if there were no quiet hours - that has to be visible.
+  if (!s.clock_known) return 'Nie działa – płytka nie zna godziny';
+  return `${minutesToTime(s.quiet_start_minute)}–${minutesToTime(s.quiet_end_minute)} (zegar płytki: ${s.local_time})`;
+}
+
+function presenceText(s) {
+  let text = s.presence_detected ? 'Wykryto' : 'Brak';
+  if (s.presence_warming_up) text = 'Rozgrzewa się';
+  if (s.presence_sensor_responding === false) text = 'Radar nie odpowiada';
+  if (s.presence_fault) text = 'Ciągły sygnał – czujnik ignorowany';
+  const sensor = SENSOR_LABELS[s.presence_sensor_active];
+  if (sensor) text = `${sensor}: ${text}`;
+  if (s.restart_required) text += ' (zmiana czujnika czeka na restart)';
+  return text;
+}
+
+function renderHistory(runs) {
+  const now = Date.now();
+  $('history').replaceChildren(...runs.map((run) => {
+    const li = document.createElement('li');
+    const time = document.createElement('span');
+    time.textContent = formatClock(new Date(now - run.started_ago_s * 1000));
+    const meta = document.createElement('span');
+    meta.className = 'muted';
+    const parts = [SOURCE_LABELS[run.source] || run.source, formatDuration(run.seconds)];
+    if (run.stopped_early) parts.push(`przerwane z ${formatDuration(run.seconds_requested)}`);
+    meta.textContent = parts.join(' · ');
+    li.append(time, meta);
+    return li;
+  }));
+  show('history-empty', runs.length === 0);
+}
+
+async function loadHistory() {
+  try {
+    const data = await api('/api/history');
+    renderHistory(data.runs || []);
+  } catch {
+    state.historyKey = null; // try again on the next poll
+  }
+}
+
+function renderControls() {
+  $('pour').disabled = state.busy;
+  $('duration').disabled = state.busy;
+  $('stop').disabled = state.busy || !(state.status && state.status.pumping);
+}
+
+function setSlider(seconds) {
+  const v = Math.min(120, Math.max(1, Math.round(seconds)));
+  $('duration').value = v;
+  $('duration-value').textContent = `${v} s`;
+}
+
+let toastTimer = null;
+function toast(message) {
+  const el = $('toast');
+  el.textContent = message;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
+}
+
+// ---------- Polling ----------
+
+async function poll() {
+  clearTimeout(pollTimer);
+  const seq = ++pollSeq;
+  let status = null;
+  try {
+    status = await api('/api/status');
+  } catch {
+    // Show "no connection" rather than stale data, but keep polling.
+  }
+  if (seq !== pollSeq) return; // a newer poll already started
+
+  state.status = status;
+  renderStatus();
+  if (status) {
+    const key = `${status.cycle_count}:${status.pumping}`;
+    if (key !== state.historyKey) {
+      state.historyKey = key;
+      loadHistory();
+    }
+  }
+  if (document.visibilityState === 'visible') pollTimer = setTimeout(poll, POLL_MS);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    poll();
+  } else {
+    clearTimeout(pollTimer);
+    pollSeq++;
+  }
+});
+
+// ---------- Actions ----------
+
+// Locks the buttons for the duration of a call and shows the error, instead of
+// leaving the screen in a "I tapped and nothing happened" state.
+async function run(action) {
+  if (state.busy) return;
+  state.busy = true;
+  renderControls();
+  try {
+    await action();
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    state.busy = false;
+    renderControls();
+    poll();
+  }
+}
+
+$('duration').addEventListener('input', (e) => {
+  state.sliderTouched = true;
+  $('duration-value').textContent = `${e.target.value} s`;
+});
+
+$('pour').addEventListener('click', () =>
+  run(() => api('/api/pump/on', { method: 'POST', body: { seconds: Number($('duration').value) } })));
+
+$('stop').addEventListener('click', () => run(() => api('/api/pump/off', { method: 'POST' })));
+
+// ---------- Settings ----------
+
+const form = $('form');
+const F = form.elements;
+
+// Form field, API field, scale. Interval and hourly budget are shown in minutes.
+const FIELDS = [
+  ['interval_minutes', 'interval_seconds', 60],
+  ['run_seconds', 'run_seconds', 1],
+  ['manual_run_seconds', 'manual_run_seconds', 1],
+  ['presence_confirm_window_seconds', 'presence_confirm_window_seconds', 1],
+  ['presence_hold_seconds', 'presence_hold_seconds', 1],
+  ['presence_max_session_seconds', 'presence_max_session_seconds', 1],
+  ['presence_rest_seconds', 'presence_rest_seconds', 1],
+  ['presence_hourly_budget_minutes', 'presence_hourly_budget_seconds', 60],
+];
+
+// Radar tuning. The firmware returns and accepts these only while the
+// configured sensor is the LD2410.
+const TUNING_FIELDS = ['presence_max_gate', 'presence_sensitivity', 'presence_no_one_seconds'];
+
+function formError(message) {
+  $('form-error').textContent = message || '';
+  show('form-error', !!message);
+}
+
+function syncFields() {
+  const mode = F.mode.value;
+  show('presence-fields', mode === 'presence');
+  show('ld2410-fields', F.presence_sensor.value === 'ld2410');
+  show('confirm-window-field', F.presence_confirm_pulses.value === '2');
+  show('quiet-times', F.quiet_enabled.checked);
+  show('schedule-toggle', mode !== 'interval');
+  show('schedule-fields', scheduleActive({ mode, schedule_enabled: F.schedule_enabled.checked }));
+}
+
+function setFormEnabled(enabled) {
+  for (const el of F) el.disabled = !enabled;
+}
+
+async function loadSettings() {
+  formError(null);
+  setFormEnabled(false);
+  try {
+    const cfg = await api('/api/config');
+    F.mode.value = cfg.mode;
+    F.schedule_enabled.checked = cfg.schedule_enabled;
+    F.quiet_enabled.checked = cfg.quiet_enabled;
+    F.quiet_start.value = minutesToTime(cfg.quiet_start_minute);
+    F.quiet_end.value = minutesToTime(cfg.quiet_end_minute);
+    for (const [name, key, scale] of FIELDS) F[name].value = Math.floor(cfg[key] / scale);
+    F.presence_sensor.value = cfg.presence_sensor;
+    F.presence_confirm_pulses.value = String(cfg.presence_confirm_pulses);
+    for (const key of TUNING_FIELDS) F[key].value = typeof cfg[key] === 'number' ? cfg[key] : '';
+    syncFields();
+    setFormEnabled(true);
+  } catch (e) {
+    formError(e.message);
+  }
+}
+
+// Fresh values every time the section is opened, so it never edits a stale copy.
+$('settings').addEventListener('toggle', (e) => { if (e.target.open) loadSettings(); });
+for (const name of ['mode', 'schedule_enabled', 'quiet_enabled', 'presence_sensor', 'presence_confirm_pulses']) {
+  F[name].addEventListener('change', syncFields);
+}
+
+function buildBody() {
+  const body = {
+    mode: F.mode.value,
+    schedule_enabled: F.schedule_enabled.checked,
+    quiet_enabled: F.quiet_enabled.checked,
+    presence_sensor: F.presence_sensor.value,
+    presence_confirm_pulses: Number(F.presence_confirm_pulses.value),
+  };
+  for (const [name, key, scale] of FIELDS) {
+    const raw = F[name].value.trim();
+    if (!/^\d+$/.test(raw)) throw new Error('Wszystkie pola muszą być liczbami.');
+    body[key] = Number(raw) * scale;
+  }
+  const start = timeToMinutes(F.quiet_start.value);
+  const end = timeToMinutes(F.quiet_end.value);
+  if (start === null || end === null) throw new Error('Podaj obie godziny ciszy nocnej.');
+  if (start === end) throw new Error('Cisza nocna musi zaczynać się i kończyć o innej godzinie.');
+  body.quiet_start_minute = start;
+  body.quiet_end_minute = end;
+  if (body.presence_sensor === 'ld2410') {
+    for (const key of TUNING_FIELDS) {
+      const raw = F[key].value.trim();
+      // Empty (e.g. right after switching from PIR) = keep what the board has stored.
+      if (raw === '') continue;
+      if (!/^\d+$/.test(raw)) throw new Error('Wszystkie pola muszą być liczbami.');
+      body[key] = Number(raw);
+    }
+  }
+  return body;
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  formError(null);
+  let body;
+  try {
+    body = buildBody();
+  } catch (err) {
+    formError(err.message);
+    return;
+  }
+  setFormEnabled(false);
+  try {
+    const res = await api('/api/config', { method: 'POST', body });
+    $('settings').open = false;
+    toast(res.restart_required ? 'Zapisane. Nowy czujnik zadziała po restarcie płytki.' : 'Ustawienia zapisane.');
+    state.sliderTouched = false;
+    poll();
+  } catch (err) {
+    // The firmware's message (e.g. a run time over the safety cap) is more
+    // specific than anything we could add here.
+    formError(err.message);
+  } finally {
+    setFormEnabled(true);
+  }
+});
+
+poll();
+</script>
+</body>
+</html>

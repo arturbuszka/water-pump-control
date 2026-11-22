@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "cJSON.h"
 #include "esp_http_server.h"
@@ -32,6 +33,7 @@ static esp_err_t send_json(httpd_req_t *req, int status, cJSON *root) {
 	switch (status) {
 		case 400: httpd_resp_set_status(req, "400 Bad Request"); break;
 		case 409: httpd_resp_set_status(req, "409 Conflict"); break;
+		case 415: httpd_resp_set_status(req, "415 Unsupported Media Type"); break;
 		case 503: httpd_resp_set_status(req, "503 Service Unavailable"); break;
 		default: httpd_resp_set_status(req, "200 OK"); break;
 	}
@@ -48,9 +50,30 @@ static esp_err_t send_error(httpd_req_t *req, int status, const char *message) {
 	return send_json(req, status, root);
 }
 
+// Every POST must say it carries JSON. A browser sends that header cross-origin
+// only after a CORS preflight, which this server never answers, so any other
+// web page open on a phone in the LAN cannot start the pump with a plain form
+// POST. Answers the client itself on failure.
+static bool require_json(httpd_req_t *req) {
+	static const char want[] = "application/json";
+	char type[48];
+	// ESP_ERR_HTTPD_RESULT_TRUNC still fills the buffer - a long header with
+	// parameters is fine, only the prefix matters.
+	esp_err_t err = httpd_req_get_hdr_value_str(req, "Content-Type", type, sizeof(type));
+	if ((err != ESP_OK && err != ESP_ERR_HTTPD_RESULT_TRUNC) ||
+	    strncasecmp(type, want, sizeof(want) - 1) != 0) {
+		send_error(req, 415, "Content-Type must be application/json");
+		return false;
+	}
+	return true;
+}
+
 // Reads the whole body and parses it. Returns NULL after answering the client
 // itself, so the caller just returns ESP_OK.
 static cJSON *read_body_json(httpd_req_t *req, char *buf, size_t buf_len) {
+	if (!require_json(req)) {
+		return NULL;
+	}
 	if (req->content_len == 0) {
 		// An empty body is legal - it means "use the configured defaults".
 		return cJSON_CreateObject();
@@ -290,6 +313,9 @@ static esp_err_t pump_on_handler(httpd_req_t *req) {
 }
 
 static esp_err_t pump_off_handler(httpd_req_t *req) {
+	if (!require_json(req)) {
+		return ESP_OK;
+	}
 	pump_stop();
 	cJSON *root = cJSON_CreateObject();
 	cJSON_AddBoolToObject(root, "ok", true);
@@ -414,14 +440,26 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
 	return send_json(req, 200, root);
 }
 
+// The phone UI: web/index.html, embedded by src/CMakeLists.txt.
+extern const char index_html_start[] asm("_binary_index_html_start");
+extern const char index_html_end[] asm("_binary_index_html_end");
+
+static esp_err_t index_get_handler(httpd_req_t *req) {
+	httpd_resp_set_type(req, "text/html; charset=utf-8");
+	// The page changes only with a reflash; revalidating every load means the
+	// phone never keeps showing the previous firmware's UI.
+	httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+	return httpd_resp_send(req, index_html_start, index_html_end - index_html_start);
+}
+
 esp_err_t http_api_start(void) {
 	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 	config.lru_purge_enable = true;
 	// Handlers keep a MAX_BODY_LEN buffer and the config on the stack; the
 	// 4 KB default leaves too little headroom for cJSON on top.
 	config.stack_size = 6144;
-	// Four GETs and three POSTs, registered below.
-	config.max_uri_handlers = 8;
+	// Five GETs and three POSTs, registered below, with room to spare.
+	config.max_uri_handlers = 12;
 
 	httpd_handle_t server = NULL;
 	esp_err_t err = httpd_start(&server, &config);
@@ -431,6 +469,7 @@ esp_err_t http_api_start(void) {
 	}
 
 	static const httpd_uri_t routes[] = {
+		{.uri = "/", .method = HTTP_GET, .handler = index_get_handler},
 		{.uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler},
 		{.uri = "/api/history", .method = HTTP_GET, .handler = history_get_handler},
 		{.uri = "/api/presence/events", .method = HTTP_GET, .handler = presence_events_get_handler},
@@ -443,6 +482,6 @@ esp_err_t http_api_start(void) {
 		ESP_ERROR_CHECK(httpd_register_uri_handler(server, &routes[i]));
 	}
 
-	ESP_LOGI(TAG, "REST API listening on port 80");
+	ESP_LOGI(TAG, "UI and REST API listening on port 80");
 	return ESP_OK;
 }
