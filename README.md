@@ -7,12 +7,13 @@ board with an ESP-WROOM-32 module** and a single-channel opto-isolated relay mod
 Written against **ESP-IDF**. The board stays awake on WiFi and exposes a small REST
 API, so it can pour on a schedule, on demand from the phone, or by itself when a
 presence sensor (a PIR or an HLK-LD2410C radar) sees a cat at the bowl — for as long
-as the cat stays, not for a fixed time. The phone app is a separate PWA, Posejdon,
-which proxies this API.
+as the cat stays, not for a fixed time. The board also serves its own phone UI — open
+`http://waterpump.local` (or its IP) on any device in the home WiFi; see
+[Web UI](#web-ui).
 
 > **This build is mains powered, not battery powered.** An always-on radio and CPU
 > draw roughly 50–80 mA. Earlier revisions deep-slept between cycles for a ~10 µA
-> average; that is gone, because a sleeping board cannot answer the app. The pump
+> average; that is gone, because a sleeping board cannot answer the phone. The pump
 > needs a 5V supply anyway.
 
 ## Wiring
@@ -231,6 +232,32 @@ is unit-tested on a PC — see [Tests](#tests). The defaults come from a simulat
 cat visits; `presence_score` in the status shows `x` live, which is what to watch
 when tuning `presence_hold_seconds`.
 
+## Web UI
+
+`GET /` serves a single page, [web/index.html](web/index.html): status, pour-now with
+a duration slider, stop, the last runs and every setting. Plain HTML, CSS and JS in
+one file, no framework, no build step. It is embedded into the firmware
+(`EMBED_FILES` in [src/CMakeLists.txt](src/CMakeLists.txt) and
+`board_build.embed_files` in [platformio.ini](platformio.ini) — PlatformIO needs
+both) and calls the REST API below from the same origin. It works only in the
+home network: nothing here reaches the board from outside.
+
+The page polls `/api/status` every 2 s while it is visible, and fetches
+`/api/history` only when a run starts or ends. Times come from the board relative
+to now and are turned into clock times with the phone's clock.
+
+### Working on the UI
+
+Every change to the page otherwise means a reflash. Instead, serve the file from
+disk and forward the API to a running board:
+
+```sh
+tools/dev_server.py http://192.168.1.42          # open http://localhost:8000
+tools/dev_server.py http://192.168.1.42 --host 0.0.0.0   # reachable from the phone too
+```
+
+Edit `web/index.html`, refresh the browser, flash when done.
+
 ## REST API
 
 The board announces itself over mDNS as **`waterpump.local`**. If mDNS does not
@@ -238,8 +265,14 @@ resolve on your network (it is unreliable on some Windows setups and on guest VL
 use the IP address from the boot log instead. There is **no authentication** — anyone
 on the LAN can run the pump.
 
+Every `POST` must carry `Content-Type: application/json`, otherwise it gets HTTP 415.
+Browsers send that header cross-origin only after a CORS preflight, which the board
+never answers, so a random web page open on a phone in the LAN cannot start the pump
+with a plain form POST. With curl, use `--json`.
+
 | Method | Path | Body | Notes |
 |---|---|---|---|
+| `GET` | `/` | — | The [web UI](#web-ui) |
 | `GET` | `/api/status` | — | State, counters and current config |
 | `GET` | `/api/history` | — | Last 10 finished runs |
 | `GET` | `/api/presence/events` | — | Last 200 raw presence-sensor pulses |
@@ -319,7 +352,7 @@ pump; `seq` restarts at 0 after a reboot.
 
 To keep more than 200 pulses, run
 [tools/collect_presence_events.py](tools/collect_presence_events.py) on any machine
-that can reach the board (or Posejdon). It polls the endpoint, converts times to wall
+that can reach the board. It polls the endpoint, converts times to wall
 clock, and appends each finished pulse to a JSONL file:
 
 ```sh
@@ -330,7 +363,7 @@ tools/collect_presence_events.py http://waterpump.local presence_events.jsonl
 
 `POST /api/config` takes any subset of the fields below; omitted fields keep their
 value. **Out-of-range values are rejected with HTTP 400, never silently clamped** — a
-typo in the app surfaces as an error rather than as a surprise at the bowl. The
+typo in the UI surfaces as an error rather than as a surprise at the bowl. The
 response carries the new config and `restart_required`.
 
 | Field | Accepted | Notes |
@@ -361,9 +394,9 @@ saved), but a warning is logged and `presence_sensor_responding` turns `false`.
 ```sh
 curl http://waterpump.local/api/status
 curl http://waterpump.local/api/history
-curl -X POST http://waterpump.local/api/pump/on -d '{"seconds":10}'
-curl -X POST http://waterpump.local/api/pump/off
-curl -X POST http://waterpump.local/api/config -d '{"interval_seconds":7200}'
+curl --json '{"seconds":10}' http://waterpump.local/api/pump/on
+curl --json '{}' http://waterpump.local/api/pump/off
+curl --json '{"interval_seconds":7200}' http://waterpump.local/api/config
 ```
 
 ## Configuration
@@ -472,11 +505,11 @@ gcc -std=c11 -Wall -Wextra -Iinclude test/test_presence_logic.c src/presence_log
    - No clicks → 3.3V isn't enough, add the transistor driver above.
    - Clicks inverted relative to the log → flip `RELAY_ACTIVE_LOW`.
 4. Shorten the schedule for testing:
-   `curl -X POST http://waterpump.local/api/config -d '{"interval_seconds":60,"run_seconds":3}'`
+   `curl --json '{"interval_seconds":60,"run_seconds":3}' http://waterpump.local/api/config`
    You should hear a cycle every minute.
-5. Check the manual path: `curl -X POST http://waterpump.local/api/pump/on -d '{"seconds":5}'`
+5. Check the manual path: `curl --json '{"seconds":5}' http://waterpump.local/api/pump/on`
    clicks immediately, and `/api/pump/off` during a run stops it within a second.
-6. Check the guard rail: `curl -X POST http://waterpump.local/api/config -d '{"run_seconds":9999}'`
+6. Check the guard rail: `curl --json '{"run_seconds":9999}' http://waterpump.local/api/config`
    must return **400**. If it returns 200, stop and fix that before adding water.
 7. Put a multimeter in continuity mode across **COM–NO**: open when off, closed when
    on. This confirms you're using the right contact pair.
@@ -499,7 +532,7 @@ gcc -std=c11 -Wall -Wextra -Iinclude test/test_presence_logic.c src/presence_log
    `curl http://waterpump.local/api/status` — `presence_detected` should flip to
    `true` while your hand is there, `false` shortly after, regardless of `mode`.
 4. Switch into presence mode:
-   `curl -X POST http://waterpump.local/api/config -d '{"mode":"presence"}'`
+   `curl --json '{"mode":"presence"}' http://waterpump.local/api/config`
    (after a reboot, wait out the PIR's warm-up first — `presence_warming_up: false`).
 5. Wave once. Expect a relay click and a `session start` log line within about half a
    second, `presence_score` around 1–2 in the status, and `session end` some 20–30 s
@@ -507,7 +540,7 @@ gcc -std=c11 -Wall -Wextra -Iinclude test/test_presence_logic.c src/presence_log
 6. Keep waving every few seconds: the pump must keep running and `presence_score`
    stay up; stop, and it must end about half a minute later.
 7. Radar only: try tightening sensitivity to see the sensor-side push take effect:
-   `curl -X POST http://waterpump.local/api/config -d '{"presence_sensitivity":10}'`
+   `curl --json '{"presence_sensitivity":10}' http://waterpump.local/api/config`
    should make a distant wave less likely to register.
 8. Set `mode` back to whatever you actually want.
 
