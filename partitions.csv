@@ -1,0 +1,7 @@
+# Name,   Type, SubType, Offset,  Size
+# The default single_app table leaves only 1MB for the application, which the
+# WiFi + HTTP + mDNS build very nearly fills. These modules carry 4MB, so give
+# the app 2MB and leave room to grow.
+nvs,      data, nvs,     0x9000,  0x6000
+phy_init, data, phy,     0xf000,  0x1000
+factory,  app,  factory, 0x10000, 0x200000
