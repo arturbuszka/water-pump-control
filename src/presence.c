@@ -150,8 +150,11 @@ static void presence_task(void *arg) {
 		presence_logic_input_t in = {
 			.out = present,
 			// Mode can change at any time from the app; leaving presence mode
-			// resets the score so coming back doesn't inherit a stale one.
-			.enabled = cfg.mode == PUMP_MODE_PRESENCE && !presence_warming_up(),
+			// resets the score so coming back doesn't inherit a stale one. Quiet
+			// hours work the same way: a session in progress ends, and the morning
+			// starts from a clean score.
+			.enabled = cfg.mode == PUMP_MODE_PRESENCE && !presence_warming_up() &&
+			           !pump_quiet_active(&cfg),
 			.pump_any = pump.pumping,
 			.pump_ours = ours,
 		};

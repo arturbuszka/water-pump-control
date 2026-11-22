@@ -56,9 +56,14 @@ void pump_get_state(pump_state_t *out_state);
 // Copies up to `max` finished runs into `out`, newest first. Returns how many.
 size_t pump_get_history(pump_history_entry_t *out, size_t max);
 
-// esp_timer time (microseconds since boot) of the next scheduled cycle, or -1
-// if the schedule is not active under the current configuration.
+// esp_timer time (microseconds since boot) of the next scheduled cycle that quiet
+// hours will let through, or -1 if the schedule is not active under the current
+// configuration or quiet hours swallow every cycle.
 int64_t pump_next_scheduled_us(void);
+
+// True if quiet hours hold automatic runs off right now under this configuration.
+// False whenever the time of day is unknown.
+bool pump_quiet_active(const pump_config_t *cfg);
 
 // Wire name of a source, for the JSON API.
 const char *pump_source_name(pump_source_t source);

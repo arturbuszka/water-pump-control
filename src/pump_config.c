@@ -8,6 +8,7 @@
 #include "nvs_flash.h"
 
 #include "config.h"
+#include "quiet_hours.h"
 
 static const char *TAG = "cfg";
 
@@ -18,6 +19,9 @@ static const char *TAG = "cfg";
 #define KEY_INTERVAL "interval_s"
 #define KEY_RUN "run_s"
 #define KEY_MANUAL "manual_s"
+#define KEY_QUIET_ENABLED "quiet_en"
+#define KEY_QUIET_START "quiet_start"
+#define KEY_QUIET_END "quiet_end"
 #define KEY_PRES_SENSOR "pres_sensor"
 #define KEY_PRES_CONFIRM "pres_confirm"
 #define KEY_PRES_WINDOW "pres_window_s"
@@ -83,6 +87,9 @@ bool presence_sensor_type_from_name(const char *name, presence_sensor_type_t *ou
 		.interval_seconds = PUMP_INTERVAL_SECONDS, \
 		.run_seconds = PUMP_ON_SECONDS_EFFECTIVE, \
 		.manual_run_seconds = PUMP_MANUAL_ON_SECONDS, \
+		.quiet_enabled = QUIET_ENABLED_DEFAULT, \
+		.quiet_start_minute = QUIET_START_MINUTE_DEFAULT, \
+		.quiet_end_minute = QUIET_END_MINUTE_DEFAULT, \
 		.presence_sensor = PRESENCE_SENSOR_DEFAULT, \
 		.presence_confirm_pulses = PRESENCE_CONFIRM_PULSES, \
 		.presence_confirm_window_seconds = PRESENCE_CONFIRM_WINDOW_SECONDS, \
@@ -118,6 +125,17 @@ bool pump_config_validate(const pump_config_t *cfg, char *reason, size_t reason_
 	// A cycle that outlasts its own interval would retrigger before it finished.
 	if (cfg->run_seconds >= cfg->interval_seconds) {
 		snprintf(reason, reason_len, "run_seconds must be shorter than interval_seconds");
+		return false;
+	}
+	// Checked even while switched off, so the stored hours are always usable.
+	if (cfg->quiet_start_minute >= QUIET_MINUTES_PER_DAY ||
+	    cfg->quiet_end_minute >= QUIET_MINUTES_PER_DAY) {
+		snprintf(reason, reason_len, "quiet hours must be 0..%u minutes", QUIET_MINUTES_PER_DAY - 1);
+		return false;
+	}
+	// Could mean "never" or "all day"; make the app say which.
+	if (cfg->quiet_start_minute == cfg->quiet_end_minute) {
+		snprintf(reason, reason_len, "quiet hours must start and end at different times");
 		return false;
 	}
 	if (cfg->presence_sensor != PRESENCE_SENSOR_PIR &&
@@ -193,6 +211,11 @@ esp_err_t pump_config_load(pump_config_t *out_cfg) {
 	nvs_get_u32(handle, KEY_INTERVAL, &out_cfg->interval_seconds);
 	nvs_get_u32(handle, KEY_RUN, &out_cfg->run_seconds);
 	nvs_get_u32(handle, KEY_MANUAL, &out_cfg->manual_run_seconds);
+	uint8_t quiet_enabled = out_cfg->quiet_enabled ? 1 : 0;
+	nvs_get_u8(handle, KEY_QUIET_ENABLED, &quiet_enabled);
+	out_cfg->quiet_enabled = quiet_enabled != 0;
+	nvs_get_u32(handle, KEY_QUIET_START, &out_cfg->quiet_start_minute);
+	nvs_get_u32(handle, KEY_QUIET_END, &out_cfg->quiet_end_minute);
 	uint8_t sensor = (uint8_t)out_cfg->presence_sensor;
 	nvs_get_u8(handle, KEY_PRES_SENSOR, &sensor);
 	out_cfg->presence_sensor = (presence_sensor_type_t)sensor;
@@ -216,6 +239,11 @@ esp_err_t pump_config_load(pump_config_t *out_cfg) {
 		return ESP_OK;
 	}
 
+	ESP_LOGI(TAG, "quiet hours %s, %02lu:%02lu-%02lu:%02lu", out_cfg->quiet_enabled ? "on" : "off",
+	         (unsigned long)out_cfg->quiet_start_minute / 60,
+	         (unsigned long)out_cfg->quiet_start_minute % 60,
+	         (unsigned long)out_cfg->quiet_end_minute / 60,
+	         (unsigned long)out_cfg->quiet_end_minute % 60);
 	ESP_LOGI(TAG, "loaded: mode=%s schedule=%s interval=%lus run=%lus manual=%lus presence(sensor=%s "
 	         "confirm=%lu/%lus hold=%lus max=%lus rest=%lus budget=%lus/h gate=%lu sens=%lu no_one=%lus)",
 	         pump_mode_name(out_cfg->mode), pump_schedule_active(out_cfg) ? "on" : "off",
@@ -246,6 +274,9 @@ esp_err_t pump_config_save(const pump_config_t *cfg) {
 	if (err == ESP_OK) err = nvs_set_u32(handle, KEY_INTERVAL, cfg->interval_seconds);
 	if (err == ESP_OK) err = nvs_set_u32(handle, KEY_RUN, cfg->run_seconds);
 	if (err == ESP_OK) err = nvs_set_u32(handle, KEY_MANUAL, cfg->manual_run_seconds);
+	if (err == ESP_OK) err = nvs_set_u8(handle, KEY_QUIET_ENABLED, cfg->quiet_enabled ? 1 : 0);
+	if (err == ESP_OK) err = nvs_set_u32(handle, KEY_QUIET_START, cfg->quiet_start_minute);
+	if (err == ESP_OK) err = nvs_set_u32(handle, KEY_QUIET_END, cfg->quiet_end_minute);
 	if (err == ESP_OK) err = nvs_set_u8(handle, KEY_PRES_SENSOR, (uint8_t)cfg->presence_sensor);
 	if (err == ESP_OK) err = nvs_set_u32(handle, KEY_PRES_CONFIRM, cfg->presence_confirm_pulses);
 	if (err == ESP_OK) err = nvs_set_u32(handle, KEY_PRES_WINDOW, cfg->presence_confirm_window_seconds);

@@ -154,11 +154,39 @@ Details worth knowing:
   schedule on top only if `schedule_enabled` is `true`; a presence session never
   starts while a scheduled cycle is running.
 
-`POST /api/pump/on` works in every mode. `schedule_enabled` is stored but ignored in
+`POST /api/pump/on` works in every mode, and during quiet hours. `schedule_enabled` is stored but ignored in
 `interval` mode, so switching back to another mode restores whatever was set there.
 `interval_seconds` is measured from the start of one cycle to the start of the next:
 20 minutes of pumping followed by 60 minutes of rest is `run_seconds: 1200`,
 `interval_seconds: 4800`.
+
+## Quiet hours
+
+Quiet hours are not a mode: they sit on top of whichever one is selected, and stop
+the pump from starting on its own during a daily window such as 23:00-06:00.
+
+```json
+{ "quiet_enabled": true, "quiet_start_minute": 1380, "quiet_end_minute": 360 }
+```
+
+The values are local minutes since midnight. The window includes its start but not
+its end, may cross midnight, and is rejected if it starts and ends at the same time.
+
+- **Schedule:** cycles falling inside the window are skipped. The timer keeps its
+  rhythm, so the first cycle afterwards comes on its next tick - with a 1 h interval,
+  some time between 06:00 and 07:00 - and `next_run_in_s` already points at it.
+- **Presence sensor:** ignored, though the reading and the pulse log carry on. The
+  morning starts from a score of zero.
+- **Runs in progress:** a scheduled cycle or presence session stops when the window
+  begins.
+- **`POST /api/pump/on`:** unaffected. It starts, and finishes, at any hour.
+
+The time comes from SNTP (`WALL_CLOCK_NTP_SERVER`, in the `WALL_CLOCK_TZ` zone), so
+the board needs to reach an NTP server at least after each power loss. **While the
+time is unknown, quiet hours do not apply** and the pump works as if they were off.
+That includes the first-boot watering: after a power cut at night it starts straight
+away, and stops as soon as the sync puts the clock inside the window - or runs its
+full length if there is no internet.
 
 ## Presence mode
 
@@ -233,8 +261,10 @@ on the LAN can run the pump.
   "restart_required": false,
   "presence_score": 0.0, "presence_session": false, "presence_fault": false,
   "presence_budget_used_seconds": 0,
+  "quiet_active": false, "clock_known": true, "local_time": "14:02",
   "mode": "interval", "schedule_enabled": false, "interval_seconds": 3600,
   "run_seconds": 1200, "manual_run_seconds": 30,
+  "quiet_enabled": false, "quiet_start_minute": 1380, "quiet_end_minute": 360,
   "presence_sensor": "pir", "presence_confirm_pulses": 1,
   "presence_confirm_window_seconds": 10, "presence_hold_seconds": 15,
   "presence_max_session_seconds": 300, "presence_rest_seconds": 10,
@@ -245,6 +275,9 @@ on the LAN can run the pump.
 - `next_run_in_s` — time to the next scheduled cycle, or `null` when the schedule is
   not active (see [Operating modes](#operating-modes)). While the pump runs, the
   status also carries `source`: `schedule`, `manual` or `presence`.
+- `quiet_active` — [quiet hours](#quiet-hours) are holding automatic runs off right
+  now; `clock_known` — the board knows the time of day; `local_time` — that time as
+  `HH:MM`, or `null` while it is unknown.
 - `presence_detected` — the sensor's live `OUT` reading, in every mode, so you can
   see the sensor work before switching into `presence` mode.
 - `presence_sensor` is the configured sensor, `presence_sensor_active` the one this

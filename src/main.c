@@ -9,6 +9,7 @@
 #include "presence.h"
 #include "pump.h"
 #include "pump_config.h"
+#include "wall_clock.h"
 
 static const char *TAG = "main";
 
@@ -28,6 +29,7 @@ void app_main(void) {
 	ESP_LOGI(TAG, "=== water pump controller (ESP32-WROOM-32 DevKit) ===");
 
 	nvs_init();
+	wall_clock_init();
 
 	pump_config_t cfg;
 	pump_config_load(&cfg);
@@ -41,6 +43,8 @@ void app_main(void) {
 	ESP_ERROR_CHECK(presence_init(&cfg));
 
 	ESP_ERROR_CHECK(net_init());
+	// Not fatal: without the time of day, quiet hours just don't apply.
+	wall_clock_start_sync();
 	ESP_ERROR_CHECK(http_api_start());
 
 	// app_main returns; the pump task, the schedule timer, the presence task

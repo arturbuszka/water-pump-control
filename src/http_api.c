@@ -14,11 +14,12 @@
 #include "presence_sensor.h"
 #include "pump.h"
 #include "pump_config.h"
+#include "wall_clock.h"
 
 static const char *TAG = "api";
 
 // Request bodies are a handful of integers - a full config from the app is
-// ~400 bytes; anything much larger is not ours.
+// ~500 bytes; anything much larger is not ours.
 #define MAX_BODY_LEN 768
 
 static esp_err_t send_json(httpd_req_t *req, int status, cJSON *root) {
@@ -116,6 +117,9 @@ static void add_config_fields(cJSON *root, const pump_config_t *cfg) {
 	cJSON_AddNumberToObject(root, "interval_seconds", cfg->interval_seconds);
 	cJSON_AddNumberToObject(root, "run_seconds", cfg->run_seconds);
 	cJSON_AddNumberToObject(root, "manual_run_seconds", cfg->manual_run_seconds);
+	cJSON_AddBoolToObject(root, "quiet_enabled", cfg->quiet_enabled);
+	cJSON_AddNumberToObject(root, "quiet_start_minute", cfg->quiet_start_minute);
+	cJSON_AddNumberToObject(root, "quiet_end_minute", cfg->quiet_end_minute);
 	cJSON_AddStringToObject(root, "presence_sensor", presence_sensor_type_name(cfg->presence_sensor));
 	cJSON_AddNumberToObject(root, "presence_confirm_pulses", cfg->presence_confirm_pulses);
 	cJSON_AddNumberToObject(root, "presence_confirm_window_seconds",
@@ -172,8 +176,20 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
 	if (state.pumping) {
 		cJSON_AddStringToObject(root, "source", pump_source_name(state.source));
 	}
-	// The board has no wall clock, so times go out relative to now and the app
-	// turns them into clock times with its own.
+	cJSON_AddBoolToObject(root, "quiet_active", pump_quiet_active(&cfg));
+	uint32_t second_of_day;
+	if (wall_clock_second_of_day(&second_of_day)) {
+		cJSON_AddBoolToObject(root, "clock_known", true);
+		char local_time[12];
+		snprintf(local_time, sizeof(local_time), "%02u:%02u", (unsigned)(second_of_day / 3600),
+		         (unsigned)(second_of_day / 60 % 60));
+		cJSON_AddStringToObject(root, "local_time", local_time);
+	} else {
+		cJSON_AddBoolToObject(root, "clock_known", false);
+		cJSON_AddNullToObject(root, "local_time");
+	}
+	// The board's clock is not always known, so times go out relative to now and
+	// the app turns them into clock times with its own.
 	int64_t next_us = pump_next_scheduled_us();
 	if (next_us < 0) {
 		cJSON_AddNullToObject(root, "next_run_in_s");
@@ -304,6 +320,8 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
 	if (!get_uint_field(body, "interval_seconds", &cfg.interval_seconds, &found, &bad_field) ||
 	    !get_uint_field(body, "run_seconds", &cfg.run_seconds, &found, &bad_field) ||
 	    !get_uint_field(body, "manual_run_seconds", &cfg.manual_run_seconds, &found, &bad_field) ||
+	    !get_uint_field(body, "quiet_start_minute", &cfg.quiet_start_minute, &found, &bad_field) ||
+	    !get_uint_field(body, "quiet_end_minute", &cfg.quiet_end_minute, &found, &bad_field) ||
 	    !get_uint_field(body, "presence_confirm_pulses", &cfg.presence_confirm_pulses, &found,
 	                    &bad_field) ||
 	    !get_uint_field(body, "presence_confirm_window_seconds",
@@ -360,6 +378,10 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
 	if (!get_bool_field(body, "schedule_enabled", &cfg.schedule_enabled, &found, &bad_field)) {
 		cJSON_Delete(body);
 		return send_error(req, 400, "schedule_enabled must be true or false");
+	}
+	if (!get_bool_field(body, "quiet_enabled", &cfg.quiet_enabled, &found, &bad_field)) {
+		cJSON_Delete(body);
+		return send_error(req, 400, "quiet_enabled must be true or false");
 	}
 
 	const cJSON *mode_item = cJSON_GetObjectItemCaseSensitive(body, "mode");

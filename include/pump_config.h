@@ -43,6 +43,14 @@ typedef struct {
 	// How long a "pour now" request runs when it does not name its own duration.
 	uint32_t manual_run_seconds;
 
+	// Hours in which nothing starts the pump on its own, whatever the mode - the
+	// sensor and the schedule are both held off, and a run of theirs in progress
+	// is stopped. "Pour now" is not affected. Local minutes since midnight, see
+	// quiet_hours.h. Has no effect while the time of day is unknown.
+	bool quiet_enabled;
+	uint32_t quiet_start_minute;
+	uint32_t quiet_end_minute;
+
 	// PUMP_MODE_PRESENCE only, below.
 
 	// The sensor wired to PRESENCE_GPIO; takes effect on the next boot.

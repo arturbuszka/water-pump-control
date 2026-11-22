@@ -9,6 +9,8 @@
 #include "freertos/task.h"
 
 #include "config.h"
+#include "quiet_hours.h"
+#include "wall_clock.h"
 
 static const char *TAG = "pump";
 
@@ -105,6 +107,17 @@ static void state_tick(uint32_t seconds_left) {
 	xSemaphoreGive(s_state_lock);
 }
 
+// Whether quiet hours keep this source from running right now. A "pour now" is
+// somebody asking for water on purpose, so it is never held off.
+static bool quiet_blocks(pump_source_t source) {
+	if (source == PUMP_SOURCE_MANUAL) {
+		return false;
+	}
+	pump_config_t cfg;
+	pump_get_config(&cfg);
+	return pump_quiet_active(&cfg);
+}
+
 // Runs the pump for `seconds`, waking every second so a stop request lands
 // promptly instead of after the whole run. The relay is switched off on every
 // exit path - this function must never return with the pump still energised.
@@ -135,6 +148,13 @@ static void pump_run(pump_source_t source, uint32_t seconds) {
 			stopped_early = true;
 			break;
 		}
+		// Quiet hours can begin mid-run, or a run started before the clock was
+		// set can turn out to be inside them.
+		if (quiet_blocks(source)) {
+			ESP_LOGI(TAG, "quiet hours, run cut short");
+			stopped_early = true;
+			break;
+		}
 		elapsed = xTaskGetTickCount() - started;
 		state_tick(elapsed >= duration ? 0 : (duration - elapsed) / configTICK_RATE_HZ);
 	}
@@ -162,6 +182,12 @@ static void pump_task(void *arg) {
 			// not cut the new one short. A stale stop cannot match the new run
 			// id anyway, but the notification itself would still wake us early.
 			ulTaskNotifyTake(pdTRUE, 0);
+			// Checked here rather than in pump_request(): a request can sit in
+			// the queue behind a long run until after quiet hours have begun.
+			if (quiet_blocks(req.source)) {
+				ESP_LOGI(TAG, "quiet hours, %s run skipped", pump_source_name(req.source));
+				continue;
+			}
 			pump_run(req.source, req.seconds);
 		}
 	}
@@ -307,8 +333,26 @@ size_t pump_get_history(pump_history_entry_t *out, size_t max) {
 int64_t pump_next_scheduled_us(void) {
 	xSemaphoreTake(s_state_lock, portMAX_DELAY);
 	int64_t due = pump_schedule_active(&s_cfg) ? s_next_due_us : -1;
+	pump_config_t cfg = s_cfg;
 	xSemaphoreGive(s_state_lock);
-	return due;
+
+	uint32_t second_of_day;
+	if (due < 0 || !cfg.quiet_enabled || !wall_clock_second_of_day(&second_of_day)) {
+		return due;
+	}
+	int64_t now_us = esp_timer_get_time();
+	int64_t tick_in_s = due > now_us ? (due - now_us) / 1000000 : 0;
+	int64_t next_s = quiet_hours_next_tick_s(cfg.quiet_start_minute, cfg.quiet_end_minute,
+	                                         second_of_day, (uint32_t)tick_in_s, cfg.interval_seconds);
+	return next_s < 0 ? -1 : now_us + next_s * 1000000;
+}
+
+bool pump_quiet_active(const pump_config_t *cfg) {
+	uint32_t second_of_day;
+	if (!cfg->quiet_enabled || !wall_clock_second_of_day(&second_of_day)) {
+		return false;
+	}
+	return quiet_hours_contains(cfg->quiet_start_minute, cfg->quiet_end_minute, second_of_day / 60);
 }
 
 const char *pump_source_name(pump_source_t source) {

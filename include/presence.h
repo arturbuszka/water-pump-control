@@ -13,8 +13,9 @@
 // polls its OUT pin (PRESENCE_GPIO) every PRESENCE_POLL_MS. In
 // PUMP_MODE_PRESENCE the samples drive presence_logic.c, which starts a
 // presence run when the motion score crosses its threshold and stops it once
-// the score has decayed - see presence_logic.h for the model. In other modes
-// the pin is still sampled and logged, but never acted on.
+// the score has decayed - see presence_logic.h for the model. In other modes,
+// and during quiet hours, the pin is still sampled and logged, but never acted
+// on.
 //
 // The sensor type is fixed from here until the next boot. Must be called after
 // pump_init(), since a detection calls pump_request().

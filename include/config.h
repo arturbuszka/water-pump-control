@@ -56,6 +56,19 @@
 // full interval later, so a reset loop can't flood the plants.
 #define RUN_ON_FIRST_BOOT 1
 
+// ---- Quiet hours ----
+
+// Off until asked for; these hours only fill in the form. Local minutes since
+// midnight, changed over the REST API like the cycle settings above.
+#define QUIET_ENABLED_DEFAULT 0
+#define QUIET_START_MINUTE_DEFAULT (23 * 60)
+#define QUIET_END_MINUTE_DEFAULT (6 * 60)
+
+// Where the local time for quiet hours comes from. The zone is a POSIX TZ string:
+// Central European Time, which also takes care of the daylight-saving changes.
+#define WALL_CLOCK_TZ "CET-1CEST,M3.5.0,M10.5.0/3"
+#define WALL_CLOCK_NTP_SERVER "pool.ntp.org"
+
 // ---- Presence mode: factory defaults ----
 //
 // How presence mode turns sensor pulses into pouring - the model is described
